@@ -130,14 +130,15 @@ def repack_compressed_tensors_w4a16_to_onednn(
     weight_packed: torch.Tensor = layer.weight_packed
     weight_scale: torch.Tensor = layer.weight_scale
 
-    # --- 1. Unpack weight_packed (N, K//8) → int8 (N, K) ---
-    weight_int8 = _unpack_compressed_tensors_int4(weight_packed)
+    # --- 1. Unpack weight_packed (N, K//8) → uint4 values (N, K) as int8 ---
+    # Values are unsigned INT4 in [0, 15]; stored in int8 for computation.
+    weight_unpacked = _unpack_compressed_tensors_int4(weight_packed)
 
-    # --- 2. Transpose to (K, N) ---
-    weight_int8_t = weight_int8.t().contiguous()  # (K, N)
+    # --- 2. Transpose to (K, N) – switch to "weight is K×N" layout ---
+    weight_kn = weight_unpacked.t().contiguous()  # (K, N)
 
     # --- 3. Re-pack along K → (K//8, N) int32 ---
-    qweight = _pack_int4_along_k(weight_int8_t)  # (K//8, N)
+    qweight = _pack_int4_along_k(weight_kn)  # (K//8, N)
 
     # --- 4. Make K-dimension contiguous (oneDNN requirement) ---
     # After this operation the shape stays (K//8, N) but strides become

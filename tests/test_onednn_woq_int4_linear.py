@@ -23,6 +23,8 @@ pytestmark = pytest.mark.skipif(
 )
 
 MINI_PYTEST_PARAMS: dict = {
+    # Used by tests/conftest.py pytest_generate_tests hook to override
+    # parametrize values when XPU_KERNEL_TEST_SCOPE=mini.
     "test_onednn_woq_int4_linear": {
         "dtype": [torch.bfloat16],
         "group_size": [128],
