@@ -316,6 +316,25 @@ def int4_gemm_w4a16(input: torch.Tensor, weight: torch.Tensor,
                                             zero_points, group_size, g_idx)
 
 
+def onednn_woq_int4_linear(
+    x: torch.Tensor,
+    qweight: torch.Tensor,
+    scales: torch.Tensor,
+    qzeros: Optional[torch.Tensor],
+    group_size: int,
+    sym: bool,
+    bias: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """oneDNN INT4 W4A16 grouped matmul for compressed-tensors pack_quantized.
+
+    v1: sym must be True (asymmetric not yet implemented).
+    qweight must be K-dim contiguous (call repack_compressed_tensors_w4a16_to_onednn first).
+    """
+    return torch.ops._xpu_C.onednn_woq_int4_linear(
+        x, qweight, scales, qzeros, group_size, sym, bias
+    )
+
+
 def int4_gemm_w4a8(input: torch.Tensor,
                    input_scales: torch.Tensor,
                    input_zero_points: torch.Tensor,
