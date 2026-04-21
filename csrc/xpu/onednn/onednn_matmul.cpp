@@ -140,6 +140,132 @@ torch::Tensor int4_gemm_w4a16(
   return result;
 }
 
+// oneDNN INT4 W4A16 grouped matmul for the compressed-tensors pack_quantized
+// layout (CompressedTensorsWNA16, sym=True). This is the XPU counterpart of
+// vLLM's Marlin-based path on CUDA.
+//
+// v1 limitations (see TODOs below):
+//   - sym must be true (asymmetric not yet implemented)
+//   - actorder not supported (no g_idx)
+//   - num_bits must be 4
+//   - group_size must be a positive multiple of 32
+//
+// qweight: int32, shape (K/8, N), 8 int4 nibbles packed along K,
+//          K-dimension contiguous (call repack_compressed_tensors_w4a16_to_onednn first).
+// scales:  shape (K/group_size, N), dtype = x.dtype.
+// qzeros:  None for symmetric (oneDNN treats zero-point as scalar 8).
+//          TODO: support asymmetric (int32, shape (K/group_size, N/8)).
+// group_size: must divide K; must be a multiple of 32.
+// sym:     must be true in v1.
+// bias:    optional (N,), dtype = x.dtype.
+torch::Tensor onednn_woq_int4_linear(
+    const torch::Tensor& x,
+    const torch::Tensor& qweight,
+    const torch::Tensor& scales,
+    const std::optional<torch::Tensor>& qzeros,
+    int64_t group_size,
+    bool sym,
+    const std::optional<torch::Tensor>& bias) {
+  const at::DeviceGuard device_guard(x.device());
+
+  // --- v1 unsupported-path checks ---
+  TORCH_CHECK(
+      sym,
+      "onednn_woq_int4_linear: v1 only supports symmetric quantization "
+      "(sym=True). Asymmetric (sym=False) is not yet implemented. "
+      "TODO: add asymmetric support in a follow-up.");
+
+  TORCH_CHECK(
+      !qzeros.has_value(),
+      "onednn_woq_int4_linear: qzeros must be None for symmetric "
+      "quantization. Pass None when sym=True.");
+
+  // --- dtype checks ---
+  TORCH_CHECK(
+      x.scalar_type() == at::ScalarType::BFloat16 ||
+          x.scalar_type() == at::ScalarType::Half,
+      "onednn_woq_int4_linear: x must be bf16 or fp16, got ",
+      x.scalar_type());
+
+  TORCH_CHECK(
+      x.dim() == 2 || x.dim() == 3,
+      "onednn_woq_int4_linear: x must be 2D [M, K] or 3D [B, M, K], got ",
+      x.dim(),
+      "D");
+
+  TORCH_CHECK(
+      qweight.scalar_type() == at::ScalarType::Int,
+      "onednn_woq_int4_linear: qweight must be int32, got ",
+      qweight.scalar_type());
+
+  TORCH_CHECK(
+      qweight.dim() == 2,
+      "onednn_woq_int4_linear: qweight must be 2D [K/8, N], got ",
+      qweight.dim(),
+      "D");
+
+  // --- shape checks ---
+  const int64_t K = x.size(x.dim() - 1);
+  const int64_t N = qweight.size(1);
+
+  TORCH_CHECK(
+      group_size > 0 && group_size % 32 == 0,
+      "onednn_woq_int4_linear: group_size must be a positive multiple of 32, "
+      "got ",
+      group_size);
+
+  TORCH_CHECK(
+      K % group_size == 0,
+      "onednn_woq_int4_linear: K (",
+      K,
+      ") must be divisible by group_size (",
+      group_size,
+      ")");
+
+  TORCH_CHECK(
+      qweight.size(0) == K / 8,
+      "onednn_woq_int4_linear: qweight.size(0) must be K/8 = ",
+      K / 8,
+      " but got ",
+      qweight.size(0));
+
+  // qweight must be K-dimension contiguous (stride[0] == 1)
+  TORCH_CHECK(
+      qweight.strides()[0] == 1,
+      "onednn_woq_int4_linear: qweight must be K-dimension contiguous "
+      "(strides()[0] == 1). "
+      "Call repack_compressed_tensors_w4a16_to_onednn() to prepare the "
+      "weight layout.");
+
+  const int64_t num_groups = K / group_size;
+  TORCH_CHECK(
+      scales.dim() == 2 && scales.size(0) == num_groups &&
+          scales.size(1) == N,
+      "onednn_woq_int4_linear: scales must have shape [K/group_size=",
+      num_groups,
+      ", N=",
+      N,
+      "] but got [",
+      (scales.dim() >= 1 ? scales.size(0) : -1),
+      ", ",
+      (scales.dim() >= 2 ? scales.size(1) : -1),
+      "]");
+
+  // --- Symmetric zero-point: scalar 8 ---
+  // oneDNN interprets the weight nibbles as unsigned (0-15) and subtracts
+  // the zero-point, so scalar 8 corresponds to the signed-int4 mid-point.
+  torch::Tensor zp = torch::tensor(
+      {static_cast<int8_t>(8)},
+      torch::dtype(torch::kInt8).device(x.device()));
+
+  // --- Execute the oneDNN INT4 W4A16 matmul ---
+  torch::Tensor result =
+      check_and_create_output_tensor(x, qweight, x.scalar_type());
+  oneDNN::dnnl_matmul_w4a16_int4(result, x, qweight, bias, scales, zp,
+                                  group_size);
+  return result;
+}
+
 torch::Tensor int4_gemm_w4a8(
     const torch::Tensor& A_,       // quantized inputs, [b, m, k]
     const torch::Tensor& A_scale,  // [b * m, 1] or [b]

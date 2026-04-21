@@ -31,6 +31,20 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, xpu_ops) {
       "Tensor B_zp, int group_size, Tensor? g_idx) -> Tensor");
   xpu_ops.impl("int4_gemm_w4a16", torch::kXPU, &int4_gemm_w4a16);
 
+  // oneDNN INT4 W4A16 grouped matmul for compressed-tensors pack_quantized
+  // layout (vLLM's CompressedTensorsWNA16 on XPU). v1: sym=True only.
+  // qweight: int32 (K/8, N), K-dim contiguous (call
+  //   repack_compressed_tensors_w4a16_to_onednn first).
+  // scales: (K/group_size, N), dtype = x.dtype.
+  // qzeros: None for sym=True (oneDNN uses scalar zero-point 8 internally).
+  // group_size: must divide K and be a positive multiple of 32.
+  // TODO: asymmetric (sym=False) and act-order (g_idx) in follow-up PRs.
+  xpu_ops.def(
+      "onednn_woq_int4_linear(Tensor x, Tensor qweight, Tensor scales, "
+      "Tensor? qzeros, int group_size, bool sym, Tensor? bias) -> Tensor");
+  xpu_ops.impl(
+      "onednn_woq_int4_linear", torch::kXPU, &onednn_woq_int4_linear);
+
   xpu_ops.def(
       "int4_gemm_w4a8(Tensor A_, Tensor A_scale, Tensor A_zp, Tensor B, "
       "Tensor B_scale, Tensor B_zp, int group_size, Tensor? g_idx, Tensor? "

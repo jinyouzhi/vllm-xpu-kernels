@@ -41,6 +41,20 @@ torch::Tensor int4_gemm_w4a16(
     int64_t group_size,
     const std::optional<torch::Tensor>& g_idx);
 
+// oneDNN INT4 W4A16 grouped matmul for the compressed-tensors pack_quantized
+// layout (vLLM's CompressedTensorsWNA16 on XPU). v1 supports sym=True only.
+// qweight: int32 (K/8, N), K-dim contiguous; scales: (K/group_size, N).
+// qzeros: None for sym=True; group_size must divide K and be a multiple of 32.
+// TODO: add asymmetric (sym=False) support in a follow-up.
+torch::Tensor onednn_woq_int4_linear(
+    const torch::Tensor& x,
+    const torch::Tensor& qweight,
+    const torch::Tensor& scales,
+    const std::optional<torch::Tensor>& qzeros,
+    int64_t group_size,
+    bool sym,
+    const std::optional<torch::Tensor>& bias);
+
 torch::Tensor int4_gemm_w4a8(
     const torch::Tensor& A_,
     const torch::Tensor& A_scale,

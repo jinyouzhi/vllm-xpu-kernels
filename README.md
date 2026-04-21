@@ -35,7 +35,7 @@ Kernels are written in SYCL/DPC++ and leverage [oneDNN](https://github.com/oneap
 | **Positional Encoding** | Rotary embedding (NeoX and GPT-J styles), DeepSeek scaling RoPE |
 | **Mixture of Experts** | TopK scoring (softmax/sigmoid), grouped TopK, fused grouped TopK; MoE align sum, MoE gather, expert remapping |
 | **LoRA** | LoRA operator support |
-| **Quantization** | FP8, MxFP4 quantization and GEMM |
+| **Quantization** | FP8, MxFP4 quantization and GEMM; INT4 W4A16 grouped GEMM (compressed-tensors) |
 | **GEMM** | Grouped GEMM |
 | **Misc** | TopK per row, memory utilities |
 
@@ -131,6 +131,58 @@ python benchmark/benchmark_lora.py
 python benchmark/benchmark_grouped_topk.py
 # etc.
 ```
+
+## Design Notes
+
+### Quantization ops
+
+#### `onednn_woq_int4_linear` — INT4 W4A16 grouped matmul for compressed-tensors
+
+**Op name**: `torch.ops._xpu_C.onednn_woq_int4_linear`
+
+**Schema**:
+```
+onednn_woq_int4_linear(Tensor x, Tensor qweight, Tensor scales,
+                        Tensor? qzeros, int group_size, bool sym,
+                        Tensor? bias) -> Tensor
+```
+
+**Intended use**: XPU kernel backing vLLM's `CompressedTensorsWNA16` (W4A16,
+group, symmetric, `type="int"`) for models such as Kimi-K2.5 whose
+`quantization_config` specifies `num_bits=4`, `strategy="group"`,
+`symmetric=true`.  This is the XPU counterpart of the CUDA/Marlin path.
+
+**Tensor layouts**:
+
+| Parameter | Shape | Dtype | Notes |
+|-----------|-------|-------|-------|
+| `x` | `(M, K)` or `(B, M, K)` | bf16 or fp16 | input activation |
+| `qweight` | `(K/8, N)` | int32 | 8 int4 nibbles packed along K; **K-dimension must be contiguous** (stride[0]==1) |
+| `scales` | `(K/group_size, N)` | bf16 or fp16 | per-group weight scales |
+| `qzeros` | `None` | — | symmetric mode: oneDNN uses scalar zero-point 8 internally |
+| `bias` | `(N,)` or `None` | bf16 or fp16 | optional additive bias |
+| output | `(M, N)` or `(B, M, N)` | same as `x` | — |
+
+**Converting from compressed-tensors `pack_quantized` layout**:
+
+```python
+from vllm_xpu_kernels.quantization.compressed_tensors_wna16 import (
+    repack_compressed_tensors_w4a16_to_onednn,
+    apply_w4a16_linear,
+)
+
+# In CompressedTensorsWNA16.process_weights_after_loading (XPU branch):
+repack_compressed_tensors_w4a16_to_onednn(layer, group_size=32, sym=True)
+
+# In CompressedTensorsWNA16.apply_weights (XPU branch):
+output = apply_w4a16_linear(layer, x, bias=None)
+```
+
+**v1 limitations**:
+- `sym` must be `True` (asymmetric raises `NotImplementedError`).
+- `actorder` must be `null` / no `weight_g_idx` (act-order raises `NotImplementedError`).
+- `num_bits` must be 4; `group_size` must divide `K` and be a positive multiple of 32.
+- MoE per-expert W4A16: separate follow-up issue.
 
 ## License
 
