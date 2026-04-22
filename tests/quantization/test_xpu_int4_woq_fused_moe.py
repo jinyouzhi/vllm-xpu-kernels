@@ -364,5 +364,5 @@ def test_repack_asymmetric_raises():
     )
 
     layer = _FakeLayer()
-    with pytest.raises((AssertionError, NotImplementedError)):
+    with pytest.raises(AssertionError):
         repack_compressed_tensors_w4a16_moe_to_xpu(layer, 32, sym=False)

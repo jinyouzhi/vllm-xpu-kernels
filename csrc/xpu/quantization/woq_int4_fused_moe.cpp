@@ -195,10 +195,9 @@ torch::Tensor xpu_int4_woq_fused_moe(
     // ----- SwiGLU activation -----
     // gate = result13[:, :I], up = result13[:, I:]
     // silu_mul = silu(gate) * up
-    auto gate = result13.narrow(1, 0, I_mid).contiguous();
-    auto up = result13.narrow(1, I_mid, I_mid).contiguous();
+    auto gate = result13.narrow(1, 0, I_mid);
+    auto up = result13.narrow(1, I_mid, I_mid);
     auto silu_mul = at::silu(gate) * up;  // [Me, I_mid]
-    silu_mul = silu_mul.contiguous();
 
     // ----- GEMM 2: silu_mul @ W2[e] -> [Me, K_hidden] -----
     // w2_qweight[e]: shape (K_hidden, I/8), strides (I/8, 1) — K-major.

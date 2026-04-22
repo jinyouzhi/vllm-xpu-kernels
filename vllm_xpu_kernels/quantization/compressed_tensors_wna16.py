@@ -85,7 +85,7 @@ def repack_compressed_tensors_w4a16_to_xpu(layer, group_size: int,
     # weight_packed: (N, K/8) → oneDNN NT: (K/8, N) strides (1, K/8)
     w_nt = _repack_one_expert_int4(layer.qweight)
     # Make the NT view concrete (copy into correct memory layout).
-    w_nt_contig = w_nt.transpose(0, 1).contiguous().transpose(0, 1)
+    w_nt_contig = w_nt.clone()
     layer.qweight.as_strided_(w_nt_contig.shape, w_nt_contig.stride())
     layer.qweight.copy_(w_nt_contig)
 
