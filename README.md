@@ -35,7 +35,7 @@ Kernels are written in SYCL/DPC++ and leverage [oneDNN](https://github.com/oneap
 | **Positional Encoding** | Rotary embedding (NeoX and GPT-J styles), DeepSeek scaling RoPE |
 | **Mixture of Experts** | TopK scoring (softmax/sigmoid), grouped TopK, fused grouped TopK; MoE align sum, MoE gather, expert remapping |
 | **LoRA** | LoRA operator support |
-| **Quantization** | FP8, MxFP4 quantization and GEMM |
+| **Quantization** | FP8, MxFP4 quantization and GEMM; INT4 W4A16 grouped-matmul (per-Linear and fused MoE) |
 | **GEMM** | Grouped GEMM |
 | **Misc** | TopK per row, memory utilities |
 
@@ -135,3 +135,56 @@ python benchmark/benchmark_grouped_topk.py
 ## License
 
 This project is licensed under the Apache License 2.0. See the [LICENSE](LICENSE) file for details.
+
+---
+
+## Quantization ops
+
+### `xpu_int4_woq_fused_moe` — INT4 W4A16 fused MoE FFN
+
+**Op schema** (registered in `_xpu_C`):
+
+```
+xpu_int4_woq_fused_moe(
+    Tensor x,
+    Tensor topk_ids,
+    Tensor topk_weights,
+    Tensor w13_qweight,
+    Tensor w13_scales,
+    Tensor? w13_qzeros,
+    Tensor w2_qweight,
+    Tensor w2_scales,
+    Tensor? w2_qzeros,
+    int group_size,
+    bool sym) -> Tensor
+```
+
+**Purpose:** Implements a full Mixture-of-Experts FFN (gate+up projection →
+SwiGLU → down projection → topk weighted reduce) using oneDNN INT4 W4A16
+grouped matmul.  It is designed to back vLLM's `CompressedTensorsWNA16MoEMethod`
+(or a new `CompressedTensorsWNA16XPUMoEMethod`) on Intel GPU instead of the
+CUDA/Marlin path.
+
+**Weight layout** (see
+`vllm_xpu_kernels/quantization/compressed_tensors_wna16.py` for the repack
+helper and `csrc/xpu/quantization/woq_int4_fused_moe.cpp` for the full
+contract):
+
+| Tensor | Shape | Dtype | Notes |
+|---|---|---|---|
+| `w13_qweight` | `(E, 2*I, K/8)` | int32 | K-major pack_quantized MoE layout from compressed-tensors |
+| `w13_scales` | `(E, K/group_size, 2*I)` | bf16/fp16 | Transposed from vLLM's `(E, 2*I, K/group_size)` |
+| `w2_qweight` | `(E, K, I/8)` | int32 | K = hidden size, I = intermediate |
+| `w2_scales` | `(E, I/group_size, K)` | bf16/fp16 | Transposed from vLLM's `(E, K, I/group_size)` |
+
+Use `repack_compressed_tensors_w4a16_moe_to_xpu` (in
+`vllm_xpu_kernels/quantization/compressed_tensors_wna16.py`) to convert a
+vLLM WNA16 MoE layer's attributes to this layout before calling the op.
+
+**v1 limitations:**
+- `sym=True` only; `w*_qzeros` must be `None`.
+- `num_bits=4` only (enforced by packed-int32 shape convention).
+- No act-order (`g_idx` not supported).
+- No expert parallelism beyond single-rank.
+- No bias (not used by Kimi-K2.5 / DeepSeekV3-style MoE).
+

@@ -103,6 +103,22 @@ void gdn_attention(
     const bool reorder_input);
 #endif
 
+// INT4 W4A16 grouped-matmul fused MoE FFN (oneDNN, XPU).
+// Weight layout: see csrc/xpu/quantization/woq_int4_fused_moe.cpp header.
+// v1: sym=true only, no act-order, no bias, no asymmetric quantization.
+torch::Tensor xpu_int4_woq_fused_moe(
+    torch::Tensor x,
+    torch::Tensor topk_ids,
+    torch::Tensor topk_weights,
+    torch::Tensor w13_qweight,
+    torch::Tensor w13_scales,
+    std::optional<torch::Tensor> w13_qzeros,
+    torch::Tensor w2_qweight,
+    torch::Tensor w2_scales,
+    std::optional<torch::Tensor> w2_qzeros,
+    int64_t group_size,
+    bool sym);
+
 bool is_bmg(int64_t device_index);
 
 bool is_pvc(int64_t device_index);
