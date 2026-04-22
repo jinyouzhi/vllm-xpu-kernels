@@ -90,6 +90,18 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, xpu_ops) {
   xpu_ops.impl("gdn_attention", torch::kXPU, &gdn_attention);
 #endif
 
+  // INT4 W4A16 grouped-matmul fused MoE FFN (oneDNN).
+  // sym=true only in v1; w*_qzeros must be None.
+  // Weight layout: see csrc/xpu/quantization/woq_int4_fused_moe.cpp.
+  xpu_ops.def(
+      "xpu_int4_woq_fused_moe("
+      "Tensor x, Tensor topk_ids, Tensor topk_weights, "
+      "Tensor w13_qweight, Tensor w13_scales, Tensor? w13_qzeros, "
+      "Tensor w2_qweight,  Tensor w2_scales,  Tensor? w2_qzeros, "
+      "int group_size, bool sym) -> Tensor");
+  xpu_ops.impl(
+      "xpu_int4_woq_fused_moe", torch::kXPU, &xpu_int4_woq_fused_moe);
+
   // for empty tensor functions, we don't need dispatch key like torch::kXPU
   xpu_ops.def("is_bmg(int device_index) -> bool");
   xpu_ops.impl("is_bmg", &is_bmg);

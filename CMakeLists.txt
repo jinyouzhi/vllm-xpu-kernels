@@ -543,6 +543,8 @@ if(XPU_SPECIFIC_KERNELS_ENABLED)
     set(_ONEDNN_SRC)
     file(GLOB _ONEDNN_SRC csrc/xpu/onednn/*.cpp)
     list(APPEND VLLM_EXT_XPU_SRC ${_ONEDNN_SRC})
+    list(APPEND VLLM_EXT_XPU_SRC
+         "csrc/xpu/quantization/woq_int4_fused_moe.cpp")
     include_directories(${ONEDNN_INCLUDE_DIR})
     link_libraries(${ONEDNN_LIBRARY})
   else()
