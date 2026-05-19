@@ -89,6 +89,26 @@ def implement_zp(qweight):
 
     return result
 
+
+def prepare_int4_moe_weights_for_xpu(w13, w2, num_experts=None):
+    if hasattr(w13, 'xpu_fused_moe'):
+        return w13, w2
+
+    assert w13.dtype == torch.uint8 and w2.dtype == torch.uint8
+    assert w13.is_contiguous() and w2.is_contiguous()
+
+    num_experts = w13.shape[0] if num_experts is None else num_experts
+    w13_tmp = torch.empty_like(w13)
+    w2_tmp = torch.empty_like(w2)
+    for i in range(num_experts):
+        w13_tmp[i] = implement_zp(w13[i])
+        w2_tmp[i] = implement_zp(w2[i])
+    w13.data = w13_tmp.contiguous()
+    w2.data = w2_tmp.contiguous()
+    w13.xpu_fused_moe = True
+    return w13, w2
+
+
 class XpuFusedMoe:
     def __init__(
         self,
@@ -117,18 +137,8 @@ class XpuFusedMoe:
 
         assert w13.is_contiguous() and w2.is_contiguous()
 
-        # FIXME: move this to vllm
-        if is_int4 and not hasattr(w13, 'xpu_fused_moe'):
-            w13_tmp = torch.empty_like(w13)
-            w2_tmp = torch.empty_like(w2)
-            for i in range(num_experts):
-                w13_tmp[i] = implement_zp(w13[i])
-                w2_tmp[i] = implement_zp(w2[i])
-            w13_tmp = w13_tmp.contiguous()
-            w2_tmp = w2_tmp.contiguous()
-            w13.data = w13_tmp
-            w2.data = w2_tmp
-            w13.xpu_fused_moe = True
+        if is_int4:
+            w13, w2 = prepare_int4_moe_weights_for_xpu(w13, w2, num_experts)
 
         self.w13 = w13
         self.w2 = w2
@@ -325,18 +335,8 @@ def xpu_fused_moe(hidden_states,
 
     assert w13.is_contiguous() and w2.is_contiguous()
 
-    # FIXME: move this to vllm
-    if is_int4 and not hasattr(w13, 'xpu_fused_moe'):
-        w13_tmp = torch.empty_like(w13)
-        w2_tmp = torch.empty_like(w2)
-        for i in range(num_experts):
-            w13_tmp[i] = implement_zp(w13[i])
-            w2_tmp[i] = implement_zp(w2[i])
-        w13_tmp = w13_tmp.contiguous()
-        w2_tmp = w2_tmp.contiguous()
-        w13.data = w13_tmp
-        w2.data = w2_tmp
-        w13.xpu_fused_moe = True
+    if is_int4:
+        w13, w2 = prepare_int4_moe_weights_for_xpu(w13, w2, num_experts)
 
     num_rows, hidden_size = list(hidden_states.shape)
     num_moe_inputs = n_experts_per_token * num_rows

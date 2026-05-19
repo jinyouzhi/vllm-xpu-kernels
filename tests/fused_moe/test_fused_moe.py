@@ -6,7 +6,7 @@ import torch
 
 from tests.ops.fp8_quant_op import scaled_fp8_quant
 from tests.utils import format_tc, seed_everything
-from vllm_xpu_kernels.fused_moe_interface import XpuFusedMoe
+from vllm_xpu_kernels.fused_moe_interface import XpuFusedMoe, xpu_fused_moe
 
 DEVICE = "xpu"
 
@@ -374,6 +374,106 @@ def test_fused_moe_int4(m, n, k, e, topk, dtype, has_bias):
         rtol = 2e-1
         atol = 2e-1
     torch.testing.assert_close(output, ref_out, rtol=rtol, atol=atol)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16],
+                         ids=format_tc)
+@pytest.mark.parametrize("has_bias", [False, True])
+def test_fused_moe_int4_group_size_32_functional(dtype, has_bias):
+    seed_everything(7)
+    torch.xpu.empty_cache()
+    gc.collect()
+
+    input_len = 4
+    hidden_size = 128
+    intermediate_size = 256
+    num_experts = 2
+    topk = 1
+    group_size = 32
+
+    a = torch.randn((input_len, hidden_size), device=DEVICE, dtype=dtype) / 16
+    w13 = torch.randint(
+        0,
+        0xff,
+        (num_experts, 2 * intermediate_size, hidden_size // 2),
+        device=DEVICE,
+        dtype=torch.uint8)
+    w2 = torch.randint(
+        0,
+        0xff,
+        (num_experts, hidden_size, intermediate_size // 2),
+        device=DEVICE,
+        dtype=torch.uint8)
+    ref_a = a.clone()
+
+    w13_scales = torch.pow(
+        2.0,
+        torch.randint(-5,
+                      -4,
+                      (num_experts, 2 * intermediate_size,
+                       hidden_size // group_size),
+                      device=DEVICE).float()).to(dtype)
+    w2_scales = torch.pow(
+        2.0,
+        torch.randint(-5,
+                      -4,
+                      (num_experts, hidden_size,
+                       intermediate_size // group_size),
+                      device=DEVICE).float()).to(dtype)
+
+    if has_bias:
+        w13_bias = torch.randn(
+            (num_experts, 2 * intermediate_size), device=DEVICE,
+            dtype=dtype) / 16
+        w2_bias = torch.randn(
+            (num_experts, hidden_size), device=DEVICE, dtype=dtype) / 16
+    else:
+        w13_bias = None
+        w2_bias = None
+
+    scores = torch.randn((input_len, num_experts),
+                         device=DEVICE,
+                         dtype=torch.float32)
+    expert_scores, expert_indices = torch.topk(scores,
+                                               k=topk,
+                                               dim=-1,
+                                               sorted=False)
+    flat_expert_indices = expert_indices.view(-1)
+    flat_expert_weights = expert_scores.view(-1, 1)
+
+    ref_13 = torch.empty(num_experts,
+                         2 * intermediate_size,
+                         hidden_size,
+                         dtype=dtype,
+                         device=DEVICE)
+    ref_2 = torch.empty(num_experts,
+                        hidden_size,
+                        intermediate_size,
+                        dtype=dtype,
+                        device=DEVICE)
+    for i in range(num_experts):
+        ref_13[i] = dequantize_uint4(w13[i], w13_scales[i], group_size)
+        ref_2[i] = dequantize_uint4(w2[i], w2_scales[i], group_size)
+
+    ref_out = ref_fused_moe(ref_a, ref_13, w13_bias, ref_2, w2_bias,
+                            flat_expert_weights, flat_expert_indices, topk,
+                            "silu", num_experts)
+
+    output = xpu_fused_moe(hidden_states=a,
+                           w13=w13,
+                           w13_scales=w13_scales,
+                           w13_bias=w13_bias,
+                           w2=w2,
+                           w2_scales=w2_scales,
+                           w2_bias=w2_bias,
+                           topk_weights=expert_scores,
+                           topk_ids=expert_indices,
+                           n_experts_per_token=topk,
+                           activation="silu",
+                           num_experts=num_experts,
+                           is_int4=True)
+
+    torch.testing.assert_close(output, ref_out, rtol=2e-1, atol=2e-1)
 
 
 @pytest.mark.parametrize("m,n,k", FUSED_MOE_MNK_FACTORS)

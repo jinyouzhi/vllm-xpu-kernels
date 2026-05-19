@@ -248,13 +248,13 @@ at::Tensor cutlass_grouped_gemm_xe2_impl(
     TORCH_CHECK(ptr_scales->is_contiguous(), "ptr_scales must be contiguous");
     TORCH_CHECK(
         ptr_scales->dim() == 3,
-        "ptr_scales of int4 must be 3D [num_experts, group_num, N]");
+        "ptr_scales of int4 must be 3D [num_experts, N, group_num]");
     TORCH_CHECK(
         ptr_scales->size(0) == num_experts,
         "ptr_scales.size(0) of int4 must match num_experts");
     TORCH_CHECK(
         K % ptr_scales->size(2) == 0,
-        "ptr_scales.size(2) of int4 must be divisible by K");
+        "ptr_scales.size(2) of int4 must divide K");
     TORCH_CHECK(
         ptr_scales->size(1) == N, "ptr_scales.size(1) of int4 must match N");
     int group_num = ptr_scales->size(2);
