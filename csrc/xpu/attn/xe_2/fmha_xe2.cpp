@@ -260,7 +260,7 @@ void cutlass_chunk_prefill_impl(
   // All other supported sizes (32, 64*n) divide cleanly by the default
   // TileShapeQK[1] = 32 used in the standard chunk_policy_head* set.
   const bool use_b16_policy = is_paged && (block_size == 16);
-  static constexpr int head_size_limit_72 = 72;
+  static constexpr int head_size_limit_80 = 80;
 
   if (use_b16_policy) {
     if (args.head_size <= HEAD_SIZE_LIMIT_0) {
@@ -273,8 +273,8 @@ void cutlass_chunk_prefill_impl(
           is_local,
           is_sink,
           is_lse);
-    } else if (args.head_size <= head_size_limit_72) {
-      policy_dispatch_func<chunk_policy_head72_b16>(
+    } else if (args.head_size <= head_size_limit_80) {
+      policy_dispatch_func<chunk_policy_head80_b16>(
           queue,
           cuQKType,
           args,
@@ -339,8 +339,8 @@ void cutlass_chunk_prefill_impl(
   } else if (args.head_size <= HEAD_SIZE_LIMIT_0) {
     policy_dispatch_func<chunk_policy_head64>(
         queue, cuQKType, args, is_paged, is_causal, is_local, is_sink, is_lse);
-  } else if (args.head_size <= head_size_limit_72) {
-    policy_dispatch_func<chunk_policy_head72>(
+  } else if (args.head_size <= head_size_limit_80) {
+    policy_dispatch_func<chunk_policy_head80>(
         queue, cuQKType, args, is_paged, is_causal, is_local, is_sink, is_lse);
   } else if (args.head_size <= HEAD_SIZE_LIMIT_1) {
     policy_dispatch_func<chunk_policy_head96>(

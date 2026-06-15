@@ -381,7 +381,7 @@ def test_varlen_with_paged_kv(
 @pytest.mark.parametrize("block_size", [16, 64])
 @torch.inference_mode()
 def test_varlen_with_paged_kv_head_size_72(block_size: int) -> None:
-    """Validate head_size=72 dispatch for both b16 and default chunk policies."""
+    """Validate head_size=72 through the padded head80 chunk policies."""
     torch.set_default_device("xpu")
     torch.xpu.set_device("xpu:0")
     torch.manual_seed(2026)
