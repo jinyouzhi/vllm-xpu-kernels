@@ -58,10 +58,10 @@ struct chunk_policy_head64 {
   using SubgroupLayoutQK = Layout<Shape<_8, _1, _1>>;
 };
 
-struct chunk_policy_head80 {
+struct chunk_policy_head72 {
   using ShapeQK = Shape<_128, _32, _32>;
-  using ShapePV = Shape<_128, _16, _32>;
-  using ShapeOut = Shape<_128, cute::Int<80>>;
+  using ShapePV = Shape<_128, _32, _32>;
+  using ShapeOut = Shape<_128, _96>;
   using SubgroupLayoutQK = Layout<Shape<_8, _1, _1>>;
 };
 
@@ -110,10 +110,10 @@ struct chunk_policy_head64_b16 {
   using SubgroupLayoutQK = Layout<Shape<_8, _1, _1>>;
 };
 
-struct chunk_policy_head80_b16 {
+struct chunk_policy_head72_b16 {
   using ShapeQK = Shape<_128, _16, _32>;
-  using ShapePV = Shape<_128, _16, _16>;
-  using ShapeOut = Shape<_128, cute::Int<80>>;
+  using ShapePV = Shape<_128, _32, _16>;
+  using ShapeOut = Shape<_128, _96>;
   using SubgroupLayoutQK = Layout<Shape<_8, _1, _1>>;
 };
 

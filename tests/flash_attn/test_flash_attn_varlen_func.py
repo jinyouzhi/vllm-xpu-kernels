@@ -378,10 +378,12 @@ def test_varlen_with_paged_kv(
     torch.xpu.empty_cache()
 
 
+@pytest.mark.parametrize("head_size", [72, 80])
 @pytest.mark.parametrize("block_size", [16, 64])
 @torch.inference_mode()
-def test_varlen_with_paged_kv_head_size_72(block_size: int) -> None:
-    """Validate head_size=72 through the padded head80 chunk policies."""
+def test_varlen_with_paged_kv_memory_padded_head_size(
+        block_size: int, head_size: int) -> None:
+    """Validate 32-padded kernel heads with true 72/80-dim outputs."""
     torch.set_default_device("xpu")
     torch.xpu.set_device("xpu:0")
     torch.manual_seed(2026)
@@ -390,7 +392,6 @@ def test_varlen_with_paged_kv_head_size_72(block_size: int) -> None:
     query_lens = [x[0] for x in seq_lens]
     kv_lens = [x[1] for x in seq_lens]
     num_query_heads, num_kv_heads = (8, 2)
-    head_size = 72
     dtype = torch.bfloat16
     num_blocks = 256
     max_query_len = max(query_lens)
@@ -424,6 +425,7 @@ def test_varlen_with_paged_kv_head_size_72(block_size: int) -> None:
                                     block_table=block_tables,
                                     window_size=(-1, -1),
                                     s_aux=None)
+    assert output.shape == query.shape
 
     ref_output = ref_paged_attn(query=query,
                                 key_cache=key_cache,

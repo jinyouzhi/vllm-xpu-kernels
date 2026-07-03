@@ -2,7 +2,39 @@
 #include "chunk_prefill_utils.hpp"
 #include "chunk_prefill_extern.hpp"
 
+#include <vector>
+
 using namespace cute;
+
+namespace {
+
+int64_t pad_head_size_32(int64_t head_size) {
+  return ((head_size + 31) / 32) * 32;
+}
+
+bool use_memory_padded_head(int64_t head_size) {
+  return head_size > HEAD_SIZE_LIMIT_0 && head_size < HEAD_SIZE_LIMIT_1 &&
+      head_size != pad_head_size_32(head_size);
+}
+
+std::vector<int64_t>
+with_padded_last_dim(const at::Tensor& tensor, int64_t padded_head_size) {
+  std::vector<int64_t> sizes = tensor.sizes().vec();
+  sizes.back() = padded_head_size;
+  return sizes;
+}
+
+at::Tensor zero_padded_last_dim(
+    const at::Tensor& tensor,
+    int64_t head_size,
+    int64_t padded_head_size) {
+  at::Tensor padded = at::zeros(
+      with_padded_last_dim(tensor, padded_head_size), tensor.options());
+  padded.narrow(-1, 0, head_size).copy_(tensor);
+  return padded;
+}
+
+}  // namespace
 
 void cutlass_chunk_prefill_xe2(
     sycl::queue& queue,
@@ -28,6 +60,59 @@ void cutlass_chunk_prefill_xe2(
     bool is_sink,
     std::optional<at::Tensor>& softmax_lse,
     std::optional<const at::Tensor>& is_prefill) {
+  const int64_t head_size = query.size(-1);
+  const int64_t padded_head_size = pad_head_size_32(head_size);
+  if (use_memory_padded_head(head_size)) {
+    TORCH_CHECK(
+        key_cache.size(-1) == head_size && value_cache.size(-1) == head_size &&
+            out.size(-1) == head_size,
+        "chunk_prefill memory padding expects Q/K/V/O to share head_size=",
+        head_size,
+        ", got key_cache.size(-1)=",
+        key_cache.size(-1),
+        " value_cache.size(-1)=",
+        value_cache.size(-1),
+        " out.size(-1)=",
+        out.size(-1));
+
+    at::Tensor padded_query =
+        zero_padded_last_dim(query, head_size, padded_head_size);
+    at::Tensor padded_key_cache =
+        zero_padded_last_dim(key_cache, head_size, padded_head_size);
+    at::Tensor padded_value_cache =
+        zero_padded_last_dim(value_cache, head_size, padded_head_size);
+    at::Tensor padded_out =
+        at::empty(with_padded_last_dim(out, padded_head_size), out.options());
+
+    cutlass_chunk_prefill_impl(
+        queue,
+        padded_query,
+        padded_key_cache,
+        padded_value_cache,
+        padded_out,
+        block_table,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        k_scale,
+        v_scale,
+        sm_scale,
+        sm_sink_,
+        window_size_left,
+        window_size_right,
+        is_varlen,
+        is_paged,
+        is_causal,
+        is_local,
+        is_sink,
+        softmax_lse,
+        is_prefill);
+
+    out.copy_(padded_out.narrow(-1, 0, head_size));
+    return;
+  }
+
   cutlass_chunk_prefill_impl(
       queue,
       query,
@@ -260,7 +345,7 @@ void cutlass_chunk_prefill_impl(
   // All other supported sizes (32, 64*n) divide cleanly by the default
   // TileShapeQK[1] = 32 used in the standard chunk_policy_head* set.
   const bool use_b16_policy = is_paged && (block_size == 16);
-  static constexpr int head_size_limit_80 = 80;
+  static constexpr int head_size_limit_72 = 72;
 
   if (use_b16_policy) {
     if (args.head_size <= HEAD_SIZE_LIMIT_0) {
@@ -273,8 +358,8 @@ void cutlass_chunk_prefill_impl(
           is_local,
           is_sink,
           is_lse);
-    } else if (args.head_size <= head_size_limit_80) {
-      policy_dispatch_func<chunk_policy_head80_b16>(
+    } else if (args.head_size <= head_size_limit_72) {
+      policy_dispatch_func<chunk_policy_head72_b16>(
           queue,
           cuQKType,
           args,
@@ -339,8 +424,8 @@ void cutlass_chunk_prefill_impl(
   } else if (args.head_size <= HEAD_SIZE_LIMIT_0) {
     policy_dispatch_func<chunk_policy_head64>(
         queue, cuQKType, args, is_paged, is_causal, is_local, is_sink, is_lse);
-  } else if (args.head_size <= head_size_limit_80) {
-    policy_dispatch_func<chunk_policy_head80>(
+  } else if (args.head_size <= head_size_limit_72) {
+    policy_dispatch_func<chunk_policy_head72>(
         queue, cuQKType, args, is_paged, is_causal, is_local, is_sink, is_lse);
   } else if (args.head_size <= HEAD_SIZE_LIMIT_1) {
     policy_dispatch_func<chunk_policy_head96>(
