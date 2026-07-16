@@ -12,7 +12,9 @@ from tests.utils import opcheck, seed_everything
 
 DTYPES = [torch.half, torch.bfloat16, torch.float]
 NUM_TOKENS = [7, 83, 2048]  # Arbitrary values for testing
-D = [512, 13824]  # Arbitrary values for testing
+# 896, 1792, and 6848 cover the routed, shared, and dense intermediate widths
+# used by Unlimited-OCR. Their vectorized launches need rounded work-group sizes.
+D = [512, 896, 1792, 6848, 13824]
 SEEDS = [0]
 XPU_DEVICES = [
     f"xpu:{i}" for i in range(1 if torch.xpu.device_count() == 1 else 2)

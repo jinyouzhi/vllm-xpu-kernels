@@ -444,8 +444,14 @@ class swiglustep_and_mul_kernel {
     }                                                                    \
   }                                                                      \
   if (d % vec_size != 0) vec_size = 1;                                   \
-  int64_t wg_size = std::min(                                            \
+  int64_t wg_cap = std::min(                                             \
       static_cast<int64_t>(d / vec_size), static_cast<int64_t>(1024));   \
+  /* Older XPU drivers can mis-execute this vectorized kernel when its   \
+     local size is not a power of two. The strided loop still covers all \
+     elements after rounding down. */                                    \
+  int64_t wg_size = 1;                                                   \
+  while ((wg_size << 1) <= wg_cap)                                       \
+    wg_size <<= 1;                                                       \
   switch (vec_size) {                                                    \
     VEC_LAUNCH_ACT_AND_MUL(KERNEL, ACT_FIRST, 1);                        \
     VEC_LAUNCH_ACT_AND_MUL(KERNEL, ACT_FIRST, 2);                        \
@@ -477,8 +483,14 @@ class swiglustep_and_mul_kernel {
     }                                                                    \
   }                                                                      \
   if (d % vec_size != 0) vec_size = 1;                                   \
-  int64_t wg_size = std::min(                                            \
+  int64_t wg_cap = std::min(                                             \
       static_cast<int64_t>(d / vec_size), static_cast<int64_t>(1024));   \
+  /* Older XPU drivers can mis-execute this vectorized kernel when its   \
+     local size is not a power of two. The strided loop still covers all \
+     elements after rounding down. */                                    \
+  int64_t wg_size = 1;                                                   \
+  while ((wg_size << 1) <= wg_cap)                                       \
+    wg_size <<= 1;                                                       \
   switch (vec_size) {                                                    \
     VEC_LAUNCH_ACT_AND_MUL_WITH_PARAM(KERNEL, 1);                        \
     VEC_LAUNCH_ACT_AND_MUL_WITH_PARAM(KERNEL, 2);                        \
