@@ -582,27 +582,70 @@ class count_and_sort_expert_tokens_kernel {
   }
 };
 
-template <typename scalar_t, int TOPK>
+template <typename idx_t>
+inline bool moe_sum_slot_active(
+    const idx_t* topk_ids,
+    const int32_t* expert_map,
+    int64_t expert_map_size,
+    int64_t slot) {
+  if (topk_ids == nullptr) {
+    return true;
+  }
+
+  const int64_t expert_id = static_cast<int64_t>(topk_ids[slot]);
+  if (expert_id < 0) {
+    return false;
+  }
+
+  return expert_map == nullptr ||
+         (expert_id < expert_map_size && expert_map[expert_id] >= 0);
+}
+
+template <typename scalar_t, typename idx_t, int TOPK>
 class moe_sum_kernel {
  private:
   scalar_t* output;       // [..., d]
   const scalar_t* input;  // [..., topk, d]
   int d;
+  const idx_t* topk_ids;      // [num_tokens, topk] or nullptr
+  const int32_t* expert_map;  // [num_experts] or nullptr
+  int64_t expert_map_size;
 
  public:
-  moe_sum_kernel(scalar_t* output, const scalar_t* input, int d)
-      : output(output), input(input), d(d) {}
+  moe_sum_kernel(
+      scalar_t* output,
+      const scalar_t* input,
+      int d,
+      const idx_t* topk_ids,
+      const int32_t* expert_map,
+      int64_t expert_map_size)
+      : output(output),
+        input(input),
+        d(d),
+        topk_ids(topk_ids),
+        expert_map(expert_map),
+        expert_map_size(expert_map_size) {}
 
   void operator()(sycl::nd_item<1> item) const {
     const int64_t token_idx = item.get_group(0);
+
+    bool active[TOPK];
+#pragma unroll
+    for (int k = 0; k < TOPK; ++k) {
+      active[k] = moe_sum_slot_active(
+          topk_ids, expert_map, expert_map_size, token_idx * TOPK + k);
+    }
+
     for (int64_t idx = item.get_local_id(0); idx < d;
          idx += item.get_local_range(0)) {
-      scalar_t x = 0.0;
+      float x = 0.0f;
 #pragma unroll
       for (int k = 0; k < TOPK; ++k) {
-        x += input[token_idx * TOPK * d + k * d + idx];
+        if (active[k]) {
+          x += static_cast<float>(input[token_idx * TOPK * d + k * d + idx]);
+        }
       }
-      output[token_idx * d + idx] = x;
+      output[token_idx * d + idx] = static_cast<scalar_t>(x);
     }
   }
 };
@@ -1166,12 +1209,59 @@ void batched_moe_align_block_size(
 }
 
 void moe_sum(
-    torch::Tensor& input,   // [num_tokens, topk, hidden_size]
-    torch::Tensor& output)  // [num_tokens, hidden_size]
+    torch::Tensor& input,                          // [num_tokens, topk, hidden]
+    torch::Tensor& output,                         // [num_tokens, hidden]
+    const std::optional<torch::Tensor>& topk_ids,  // [num_tokens, topk]
+    const std::optional<torch::Tensor>& expert_map)  // [num_experts]
 {
+  TORCH_CHECK(input.dim() == 3, "moe_sum: input must be a 3D tensor");
+  TORCH_CHECK(output.dim() == 2, "moe_sum: output must be a 2D tensor");
+  TORCH_CHECK(
+      input.size(0) == output.size(0) && input.size(2) == output.size(1),
+      "moe_sum: input shape must be [num_tokens, topk, hidden] matching "
+      "output [num_tokens, hidden]");
+  TORCH_CHECK(
+      input.scalar_type() == output.scalar_type(),
+      "moe_sum: input and output must have the same dtype");
+  TORCH_CHECK(
+      input.device() == output.device(),
+      "moe_sum: input and output must be on the same device");
+  TORCH_CHECK(
+      input.is_contiguous() && output.is_contiguous(),
+      "moe_sum: input and output must be contiguous");
+  TORCH_CHECK(
+      !(expert_map.has_value() && !topk_ids.has_value()),
+      "moe_sum: expert_map requires topk_ids to be provided");
+
   const int hidden_size = input.size(-1);
-  const auto num_tokens = output.numel() / hidden_size;
+  const auto num_tokens = input.size(0);
   const int topk = input.size(1);
+
+  if (topk_ids.has_value()) {
+    const auto& ids = topk_ids.value();
+    TORCH_CHECK(
+        ids.scalar_type() == at::kInt || ids.scalar_type() == at::kLong,
+        "moe_sum: topk_ids must be int32 or int64");
+    TORCH_CHECK(ids.is_contiguous(), "moe_sum: topk_ids must be contiguous");
+    TORCH_CHECK(
+        ids.device() == input.device(),
+        "moe_sum: topk_ids must be on the same device as input");
+    TORCH_CHECK(
+        ids.dim() == 2 && ids.size(0) == num_tokens && ids.size(1) == topk,
+        "moe_sum: topk_ids must have shape [num_tokens, topk]");
+  }
+
+  if (expert_map.has_value()) {
+    const auto& map = expert_map.value();
+    TORCH_CHECK(
+        map.scalar_type() == at::kInt, "moe_sum: expert_map must be int32");
+    TORCH_CHECK(map.dim() == 1, "moe_sum: expert_map must be a 1D tensor");
+    TORCH_CHECK(map.numel() > 0, "moe_sum: expert_map must not be empty");
+    TORCH_CHECK(map.is_contiguous(), "moe_sum: expert_map must be contiguous");
+    TORCH_CHECK(
+        map.device() == input.device(),
+        "moe_sum: expert_map must be on the same device as input");
+  }
 
   at::Device curDevice = at::Device(at::kXPU, at::xpu::current_device());
   at::DeviceGuard device_guard(curDevice);
@@ -1182,50 +1272,89 @@ void moe_sum(
   sycl::range<1> global_range(global_size);
   sycl::range<1> local_range(local_size);
 
+  const bool pad_aware = topk_ids.has_value();
+  const int32_t* expert_map_ptr =
+      expert_map.has_value() ? expert_map->data_ptr<int32_t>() : nullptr;
+  const int64_t expert_map_size =
+      expert_map.has_value() ? expert_map->numel() : 0;
+
+#define VLLM_MOE_SUM_LAUNCH(TOPK_VALUE)                                       \
+  VLLM_DISPATCH_FLOATING_TYPES(input.scalar_type(), "moe_sum_kernel", [&] {   \
+    auto* out_ptr = output.data_ptr<scalar_t>();                              \
+    const auto* in_ptr = input.data_ptr<scalar_t>();                          \
+    if (pad_aware) {                                                          \
+      AT_DISPATCH_INDEX_TYPES(topk_ids->scalar_type(), "moe_sum_index", [&] { \
+        const auto* ids_ptr = topk_ids->data_ptr<index_t>();                  \
+        queue.submit([&](sycl::handler& cgh) {                                \
+          cgh.parallel_for(                                                   \
+              sycl::nd_range<1>(global_range, local_range),                   \
+              vllm::moe::moe_sum_kernel<scalar_t, index_t, TOPK_VALUE>(       \
+                  out_ptr,                                                    \
+                  in_ptr,                                                     \
+                  hidden_size,                                                \
+                  ids_ptr,                                                    \
+                  expert_map_ptr,                                             \
+                  expert_map_size));                                          \
+        });                                                                   \
+      });                                                                     \
+    } else {                                                                  \
+      queue.submit([&](sycl::handler& cgh) {                                  \
+        cgh.parallel_for(                                                     \
+            sycl::nd_range<1>(global_range, local_range),                     \
+            vllm::moe::moe_sum_kernel<scalar_t, int32_t, TOPK_VALUE>(         \
+                out_ptr, in_ptr, hidden_size, nullptr, nullptr, 0));          \
+      });                                                                     \
+    }                                                                         \
+  })
+
   switch (topk) {
+    case 1:
+      VLLM_MOE_SUM_LAUNCH(1);
+      break;
+
     case 2:
-      VLLM_DISPATCH_FLOATING_TYPES(input.scalar_type(), "moe_sum_kernel", [&] {
-        queue.submit([&](sycl::handler& cgh) {
-          cgh.parallel_for(
-              sycl::nd_range<1>(global_range, local_range),
-              vllm::moe::moe_sum_kernel<scalar_t, 2>(
-                  output.data_ptr<scalar_t>(),
-                  input.data_ptr<scalar_t>(),
-                  hidden_size));
-        });
-      });
+      VLLM_MOE_SUM_LAUNCH(2);
       break;
 
     case 3:
-      VLLM_DISPATCH_FLOATING_TYPES(input.scalar_type(), "moe_sum_kernel", [&] {
-        queue.submit([&](sycl::handler& cgh) {
-          cgh.parallel_for(
-              sycl::nd_range<1>(global_range, local_range),
-              vllm::moe::moe_sum_kernel<scalar_t, 3>(
-                  output.data_ptr<scalar_t>(),
-                  input.data_ptr<scalar_t>(),
-                  hidden_size));
-        });
-      });
+      VLLM_MOE_SUM_LAUNCH(3);
       break;
 
     case 4:
-      VLLM_DISPATCH_FLOATING_TYPES(input.scalar_type(), "moe_sum_kernel", [&] {
-        queue.submit([&](sycl::handler& cgh) {
-          cgh.parallel_for(
-              sycl::nd_range<1>(global_range, local_range),
-              vllm::moe::moe_sum_kernel<scalar_t, 4>(
-                  output.data_ptr<scalar_t>(),
-                  input.data_ptr<scalar_t>(),
-                  hidden_size));
-        });
-      });
+      VLLM_MOE_SUM_LAUNCH(4);
+      break;
+
+    case 6:
+      VLLM_MOE_SUM_LAUNCH(6);
+      break;
+
+    case 8:
+      VLLM_MOE_SUM_LAUNCH(8);
+      break;
+
+    case 9:
+      VLLM_MOE_SUM_LAUNCH(9);
       break;
 
     default:
-      at::sum_out(output, input, 1);
+      if (pad_aware) {
+        auto ids = topk_ids.value();
+        auto valid = ids.ge(0);
+        if (expert_map.has_value()) {
+          auto clamped = ids.clamp(0, expert_map_size - 1).to(torch::kLong);
+          auto local = expert_map->index_select(0, clamped.reshape({-1}))
+                           .reshape(ids.sizes());
+          valid = valid.logical_and(ids.lt(expert_map_size));
+          valid = valid.logical_and(local.ge(0));
+        }
+        auto masked = input.mul(valid.unsqueeze(-1).to(input.scalar_type()));
+        at::sum_out(output, masked, 1);
+      } else {
+        at::sum_out(output, input, 1);
+      }
       break;
   }
+#undef VLLM_MOE_SUM_LAUNCH
 }
 
 void moe_lora_align_block_size(
