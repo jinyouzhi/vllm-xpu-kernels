@@ -390,13 +390,13 @@ struct causal_conv1d_tiled_kernel {
           if (token_in_sequence < 0) {
             const int state_time = token_in_sequence + Width - 1;
             if (load_initial_state) {
-                value = static_cast<T>(
-                  conv_state
-                      [static_cast<int64_t>(state_id) * conv_state_stride_0 +
-                       static_cast<int64_t>(combined_channel) *
-                           conv_state_dim_stride +
-                       static_cast<int64_t>(state_time) *
-                           conv_state_time_stride]);
+              value = static_cast<T>(
+                  conv_state[static_cast<int64_t>(state_id) *
+                                 conv_state_stride_0 +
+                             static_cast<int64_t>(combined_channel) *
+                                 conv_state_dim_stride +
+                             static_cast<int64_t>(state_time) *
+                                 conv_state_time_stride]);
             }
           } else if (token_in_sequence < seq_len) {
             const int local_token = seq_start + token_in_sequence;
