@@ -96,6 +96,22 @@ Important build environment variables:
   devices. Empty values intentionally disable AOT for the corresponding set.
 - `VLLM_CUTLASS_SRC_DIR`: use a local SYCL-TLA checkout instead of FetchContent.
 
+KDA runtime environment variables (read by `_xpu_C`, not by the build):
+
+- `VLLM_XPU_KDA_RECURRENT_MODE`: backend for the KDA gated delta rule stage.
+  `auto` (default) picks per batch, `recurrent` forces the reference kernel,
+  `opt` forces the vectorized recurrent kernel, and `chunk` forces the chunked
+  XMX pipeline. It is read once and cached, so tests that compare backends have
+  to run each one in its own process.
+- `VLLM_XPU_KDA_CHUNK_MIN_SEQLEN`: average non-spec sequence length below which
+  `auto` keeps the recurrent backend rather than paying the chunked pipeline's
+  fixed cost. Defaults to `128`.
+- `VLLM_XPU_KDA_CHUNK_MAX_WORKSPACE_MB`: scratch budget above which `auto`
+  declines the chunked pipeline. Defaults to `2048`.
+- `VLLM_XPU_KDA_CHUNK_STRICT`: raise instead of silently falling back when the
+  chunked pipeline's per-chunk cumulative log-decay saturates its clamp. Off by
+  default; the default behavior is to hand the batch to the recurrent backend.
+
 ## Architecture Notes
 
 The build produces Python extension modules under `vllm_xpu_kernels/`:
