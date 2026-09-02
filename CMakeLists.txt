@@ -31,7 +31,7 @@ install(CODE "set(CMAKE_INSTALL_LOCAL_ONLY TRUE)" ALL_COMPONENTS)
 # Supported python versions.  These versions will be searched in order, the
 # first match will be selected.  These should be kept in sync with setup.py.
 #
-set(PYTHON_SUPPORTED_VERSIONS "3.9" "3.10" "3.11" "3.12")
+set(PYTHON_SUPPORTED_VERSIONS "3.9" "3.10" "3.11" "3.12" "3.13" "3.14")
 
 # Supported Intel GPU architectures.
 set(SYCL_SUPPORTED_ARCHS "intel_gpu_pvc;intel_gpu_bmg_g21;intel_gpu_bmg_g31")
@@ -54,9 +54,9 @@ set(ONEDNN_GIT_REPO
     "https://github.com/uxlfoundation/oneDNN.git"
     CACHE STRING "oneDNN git repository URL")
 
-# rls-v3.12
+# rls-v3.13
 set(ONEDNN_GIT_TAG
-    "80afa71049cd69a3df32adcccb623b12cd7baa22"
+    "0e2a5bfeef1bfbffc3137464606540233086ce9b"
     CACHE STRING "oneDNN git commit hash or tag")
 # ARCHITECTURE OPTIONS
 option(VLLM_XPU_ENABLE_XE2 "Enable XE2 architecture kernels" ON)
@@ -77,6 +77,8 @@ option(MHC_KERNELS_ENABLED
 option(XPU_SPECIFIC_KERNELS_ENABLED
        "Build XPU-specific kernels (_xpu_C extension)" ON)
 option(XPUMEM_ALLOCATOR_ENABLED "Build xpumem_allocator extension" ON)
+option(VLLM_XPU_ENABLE_ONEDNN
+       "Build oneDNN-backed kernels (GEMM ops in _xpu_C extension)" ON)
 
 # KERNEL CONFIGURATION — controls which paged decode kernel variants are
 # compiled. Use model-specific configs to dramatically reduce compile time. See
@@ -147,6 +149,7 @@ message(STATUS "  MHC_KERNELS_ENABLED          = ${MHC_KERNELS_ENABLED}")
 message(
   STATUS "  XPU_SPECIFIC_KERNELS_ENABLED = ${XPU_SPECIFIC_KERNELS_ENABLED}")
 message(STATUS "  XPUMEM_ALLOCATOR_ENABLED     = ${XPUMEM_ALLOCATOR_ENABLED}")
+message(STATUS "  VLLM_XPU_ENABLE_ONEDNN       = ${VLLM_XPU_ENABLE_ONEDNN}")
 message(STATUS "  VLLM_PAGED_DECODE_CONFIG     = ${VLLM_PAGED_DECODE_CONFIG}")
 message(STATUS "  VLLM_CHUNK_PREFILL_CONFIG    = ${VLLM_CHUNK_PREFILL_CONFIG}")
 message(STATUS "")
@@ -174,7 +177,9 @@ append_cmake_prefix_path("torch" "torch.utils.cmake_prefix_path")
 # Import torch cmake configuration.
 find_package(Torch REQUIRED)
 
-find_package(oneDNN REQUIRED)
+if(VLLM_XPU_ENABLE_ONEDNN)
+  find_package(oneDNN REQUIRED)
+endif()
 
 #
 # Forward the non-CUDA device extensions to external CMake scripts.
@@ -321,7 +326,7 @@ if(VLLM_GPU_LANG STREQUAL "SYCL")
   # Set CUTLASS_REVISION. Used for FetchContent. Also fixes some bogus messages
   # when building.
   set(CUTLASS_REVISION
-      "cd763790ad2f74d7294435ecf77682bac0062c3a"
+      "87f6850680a580654b9ea2c80dbc01aeb36ad231"
       CACHE STRING "CUTLASS revision to use")
 
   if(DEFINED ENV{VLLM_CUTLASS_SRC_DIR})
@@ -545,6 +550,7 @@ if(BASIC_KERNELS_ENABLED)
       "csrc/attention/merge_attn_states.cpp"
       "csrc/tensor_utils.cpp"
       "csrc/utils/mem_cpy.cpp"
+      "csrc/utils/host_register.cpp"
       "csrc/utils/mem_info.cpp"
       "csrc/topk_per_row.cpp")
   include_directories("/usr/include")
@@ -628,6 +634,8 @@ if(XPU_SPECIFIC_KERNELS_ENABLED)
       "csrc/xpu/sycl/deepseek_inv_rope_fp8_quant.cpp"
       "csrc/xpu/sycl/deepseek_fused_indexer_q_rope_fp8.cpp"
       "csrc/xpu/sycl/deepseek_fused_indexer_q_rope_mxfp4.cpp"
+      "csrc/xpu/sycl/fused_input_norm.cpp"
+      "csrc/xpu/sycl/fused_kv_compress_norm_rope_insert_sparse_attn.cpp"
       "csrc/xpu/sycl/multimodal_rope.cpp"
       "csrc/xpu/sycl/apply_rotary_emb.cpp"
       "csrc/xpu/rand/exponential.cpp"
@@ -647,14 +655,23 @@ if(XPU_SPECIFIC_KERNELS_ENABLED)
   # TODO: check if we need this flags list(APPEND VLLM_GPU_FLAGS
   # "-gline-tables-only")
 
-  if(ONEDNN_FOUND)
-    set(_ONEDNN_SRC)
-    file(GLOB _ONEDNN_SRC csrc/xpu/onednn/*.cpp)
-    list(APPEND VLLM_EXT_XPU_SRC ${_ONEDNN_SRC})
-    include_directories(${ONEDNN_INCLUDE_DIR})
-    link_libraries(${ONEDNN_LIBRARY})
+  if(VLLM_XPU_ENABLE_ONEDNN)
+    if(ONEDNN_FOUND)
+      set(_ONEDNN_SRC)
+      file(GLOB _ONEDNN_SRC csrc/xpu/onednn/*.cpp)
+      # The stub only backs the disabled build; drop it here.
+      list(REMOVE_ITEM _ONEDNN_SRC
+           "${CMAKE_CURRENT_SOURCE_DIR}/csrc/xpu/onednn/onednn_stub.cpp")
+      list(APPEND VLLM_EXT_XPU_SRC ${_ONEDNN_SRC})
+      include_directories(${ONEDNN_INCLUDE_DIR})
+      link_libraries(${ONEDNN_LIBRARY})
+    else()
+      message(FATAL_ERROR "oneDNN not found!")
+    endif()
   else()
-    message(FATAL_ERROR "oneDNN not found!")
+    # oneDNN disabled: build stub ops that raise a runtime error when called so
+    # the torch ops stay registered.
+    list(APPEND VLLM_EXT_XPU_SRC "csrc/xpu/onednn/onednn_stub.cpp")
   endif()
 
   define_gpu_extension_target(
