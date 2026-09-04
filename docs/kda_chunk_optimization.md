@@ -11,15 +11,17 @@ Xe2 (Battlemage) chunked-prefill path of Kimi Delta Attention.
 | Data type | bf16 activations, fp32 accumulation |
 | Bottleneck | **memory bandwidth**, uniformly across all five stages |
 | Baseline | 22636 us over the 7-shape chunk sweep |
-| **Final** | **19739 us (-12.8%)** |
-| End-to-end prefill (49 configs) | **-4.04% geomean**, best config -10.19% |
-| Trials | 7 (3 accepted, 3 rejected, 1 neutral-but-simpler) |
+| After trials 1-6 | 19782 us (-12.6%) |
+| **Final (trial 7)** | **19426 us (-14.2%)** |
+| End-to-end prefill, trials 1-6 (49 configs) | **-4.04% geomean**, best config -10.19% |
+| End-to-end, trial 7 (133 configs) | -0.24% geomean; **-0.92%** over the 27 configs it applies to |
+| Trials | 7 (5 accepted — one only for simplicity — and 2 rejected) |
 
 Measured with `benchmark/benchmark_kda_chunk_stages.py` (chunk backend only,
 per-stage attribution under `unitrace`) and `benchmark/benchmark_kda.py` (133
 end-to-end configurations).
 
-### Kimi-Linear tp1 prefill, before vs after
+### Kimi-Linear tp1 prefill, baseline vs trials 1-6
 
 `benchmark_kda_gated_delta_rule.py` times `kda_gated_delta_rule` on its own,
 which on these shapes is entirely the five chunk kernels, so it isolates this
@@ -36,6 +38,11 @@ work from the conv1d that `benchmark_kda.py` also includes:
 
 The gain grows with sequence length, as expected for a change that removes
 bytes rather than instructions.
+
+Trial 7 lands on top of this and is reported separately in its own section,
+against its own freshly measured baseline: the two sessions differ by up to
+~1% of build-to-build drift, so its per-workload deltas are not comparable
+against the table above.
 
 > When A/B-testing two builds by swapping `.so` files, overwrite
 > `build/temp/libgdn_attn_kernels_xe_2.so`, not just the copy in
@@ -240,7 +247,8 @@ consecutive lanes read consecutive entries: a direct global read is already
 fully coalesced and warm after the first sub-group touches it.
 
 Reading it per lane removes the fill loop, one of the four per-chunk barriers,
-and the SLM allocator — `fwd_o` now uses no SLM at all.
+and the SLM allocator — `fwd_o` now uses no SLM at all. (Trial 7 later puts SLM
+back, for a much larger tile and a different reason.)
 
 Results are bit-identical and the 133-config sweep is neutral (+0.09% overall,
 -0.02% over the >=100 us subset, worst outlier +0.86% against a +-1.6% noise
@@ -248,48 +256,155 @@ band). Kept for the simpler kernel, not for speed; the barrier was evidently not
 on the critical path, consistent with the stage being bandwidth bound rather
 than sync bound.
 
-## Trial 7 (rejected): SLM-stage `U` inside `fwd_o`
+## Trial 7 (accepted): SLM-stage `U` inside `fwd_o`
 
 `U` is produced and consumed entirely within `fwd_o` on the `has_prev_state`
-path — `U := U0 - W @ S0^T` is stored to global memory, then read back twice,
+path — `U := U0 - W @ S0^T` was stored to global memory, then read back twice,
 once as the B operand of `O += O2 @ U` and once as the A operand of
 `S := S0 + U^T @ Kb`. Nothing outside the kernel reads it, so all three global
-accesses can in principle be replaced by one 8 KB SLM tile per value block.
+accesses collapse into one 8 KB SLM tile per value block, leaving only the `U0`
+load that `compute_wu` produced. The barrier that published the store can also
+drop from a global fence to a local one.
 
 The prize was priced before writing any of it, since this machine reports no
 hardware metric groups (`unitrace --metric-list` returns `No metrics found`).
-A correctness-breaking probe forced `u_offset = 0` so every (head, chunk) shares
-one buffer — same instruction count, same access pattern, but guaranteed
-L2-resident. That measured **-5.40%** on the five tp1 prefill workloads, which
-confirmed the round trip really does reach DRAM.
+A deliberately correctness-breaking probe forced `u_offset = 0` so every
+(head, chunk) shared one buffer — same instruction count, same access pattern,
+but guaranteed L2-resident. That measured **-5.40%** on the five tp1 prefill
+workloads, confirming the round trip really does reach DRAM.
 
-The implementation needs three new GEMM variants, because the block-2D copy
-atoms cannot address SLM (see the blocker list below) and the operand fragments
-must therefore be gathered element-wise: `gemm_TSlmS`, `gemm_SlmTS`, and
-`gemm_SlmTS_fused_2B`. Measured, GDR-only, against the 12413.5 us baseline:
+The implementation needs three new GEMM variants — `gemm_TSlmS`, `gemm_SlmTS`
+and `gemm_SlmTS_fused_2B` — because the block-2D copy atoms cannot address SLM
+(see the blocker list below), so the operand fragments have to be gathered from
+the tile by hand. Measured GDR-only as an interleaved A/B against the trial-6
+build (12463.5 us on the five tp1 prefill workloads, min of three samples,
+`.so` swapped through `LD_LIBRARY_PATH` between rounds). This table attributes
+the individual techniques and predates the occupancy gate described below,
+which changes the shipped totals:
 
 | variant | total | delta |
 | --- | ---: | ---: |
-| SLM for `has_prev_state`, global for the first chunk | 12213.3 us | **-1.61%** |
-| single path, everything staged through SLM | 12317.2 us | -0.78% |
-| probe ceiling (`U` fully L2-resident) | 11743.0 us | -5.40% |
+| scalar gather for both operands | 12330.7 us | -1.06% |
+| + 8-wide vector load for the A operand | 12279.7 us | -1.46% |
+| **+ local-space fence for the publish barrier** | **12262.5 us** | **-1.61%** |
+| single path, first chunk staged through SLM too | 12317.2 us | -0.78% |
+| probe ceiling, not a shippable version | 11743.0 us | -5.40% |
 
-So the staging recovers less than a third of what the round trip costs: the
-element-wise gather gives back most of the bytes it saves. Unifying the two
-paths — which is the shape the rest of this kernel wants — gives up another
-0.85%, because chunks with no carried state then pay a staging round trip they
-previously avoided.
+`benchmark_kda_gated_delta_rule.py` agrees independently at -1.59% over the same
+five workloads (12443.4 -> 12245.7 us, mean of 30 iterations), and the seven-shape
+chunk sweep moves 19787 -> 19364 us (**-2.14%**), the wider shapes gaining most
+(`b8_1k` -2.56%, `b16_512` -2.14%, `b32_256` -2.04%).
 
-Rejected: 1.6% does not pay for three near-duplicate GEMM templates plus a
-dual-source `S` update, and the version that keeps the kernel single-path falls
-below the 1% bar outright.
+So the staging recovers under a third of what the round trip costs: the gather
+gives back most of the bytes it saves. Keeping the first chunk of each sequence
+on the global path is worth another 0.85%, because those chunks do not update
+`U` and would otherwise pay for a staging round trip they do not need — hence
+the two paths.
 
-One reusable result did come out of it. The staged tile has to be laid out
-`(token, channel)`, i.e. `(K, N)` row-major for a `U^T` operand: a DPAS A/B
-sub-group fragment walks the **M/N** axis within a lane, not `K`, so this is the
-orientation that keeps each lane's slots contiguous. The intuitive
-`(N, K)` choice costs **~6%** (12994.8 us), which is larger than the entire
-optimization being attempted.
+### The staging needs an occupancy gate
+
+`b1_1k` regressed by +0.95% on the sweep above, which looked like a single
+awkward shape until the full 133-config run was checked. It is not: the delta
+tracks the work-group count of the `fwd_o` grid
+(`batch x heads x dv_groups`) almost monotonically, and the sign flips.
+
+| `fwd_o` work-groups | delta, ungated |
+| ---: | --- |
+| 8 | +6.5% .. +11.6% |
+| 16 | +5.6% .. +7.0% |
+| 32 | +2.8% .. +4.6% |
+| 64 | -0.9% .. +1.3% |
+| 128 | -0.6% .. +1.1% |
+| 256 | -4.1% .. +0.7% |
+| 512-2048 | -1.8% .. +0.1% |
+
+Ungated, that is **+0.56% geomean over all 133 configs** and +1.07% over the
+70 prefill and mixed ones — a net loss, despite the clean win on the shapes
+the trial was developed against.
+
+The mechanism is the trade the staging makes. It removes DRAM bytes, but it
+pays for them with a hand-gathered SLM operand that has no prefetch pipeline,
+replacing a block-2D load that was prefetched three tiles ahead —
+`gemm_TSlmS` alone issues 64 scalar B-operand loads per k-tile. When there are
+enough work-groups in flight, each one's gather hides behind the others and the
+saved bandwidth wins. When there are not, the kernel is latency-bound, the
+gather sits exposed on the critical path, and nothing hides it.
+
+The fix is to stage only when the grid already saturates the machine, which is
+the same threshold `chunk_kda_fwd_o_dv_groups` already uses to pick
+`dv_groups`, so the gate reuses `fwd_o_target_work_items` rather than
+introducing a second constant:
+
+```c++
+const int64_t fwd_o_work_items =
+    int64_t(batch_size) * num_heads * dv_groups * wg_size;
+stage_u_in_slm = local_dv >= 1 && local_dv <= 2 &&
+                 fwd_o_work_items >= fwd_o_target_work_items;
+```
+
+Gated, over the 133-config sweep (`benchmark_kda.py`, same build A/B-swapped):
+
+| | configs | geomean | net |
+| --- | ---: | ---: | ---: |
+| staging enabled | 27 | **-0.92%** | -1060 us |
+| staging gated off | 106 | -0.07% | +123 us |
+| all | 133 | **-0.24%** | -936 us |
+
+The 106 gated-off configs run bit-identical code to the baseline, so their
+spread is pure run-to-run noise — which usefully calibrates the noise floor at
+about +-1% on the ~26 us decode shapes, and confirms the +0.97% worst case
+among the staged configs is not distinguishable from noise either. The worst
+real regression is gone: +11.6% before the gate, +0.97% after.
+
+The gate costs some of the headline. The seven-shape chunk sweep gives back
+0.34pp (19782 -> 19426 us, **-1.80%** instead of -2.14%) and the five tp1
+prefill workloads give back 0.6pp, because `b1_1k`, `b1_4k` and `b1_8k` are
+64-work-group shapes and now take the global path:
+
+| workload | `fwd_o` WGs | staged | before | after |
+| --- | ---: | --- | ---: | ---: |
+| `prefill_b1_1k` | 64 | no | 395.0 | 396.6 (+0.41%) |
+| `prefill_b1_4k` | 64 | no | 1707.5 | 1710.3 (+0.16%) |
+| `prefill_b1_8k` | 64 | no | 3467.3 | 3469.7 (+0.07%) |
+| `prefill_b4_2k` | 256 | yes | 3478.3 | 3425.9 (**-1.51%**) |
+| `prefill_b8_1k` | 256 | yes | 3408.7 | 3326.6 (**-2.41%**) |
+| total | | | 12456.7 | 12329.1 (**-1.02%**) |
+
+That is the right trade: -1.61% on five hand-picked shapes is worth less than
+-0.24% across everything, and the three shapes it gives up were within noise of
+break-even anyway. Thresholds of 64 and 128 work-groups were also measured and
+are indistinguishable overall (-0.19% both), but leave 3-4x more regression on
+the table, so the saturation point is both the best and the most principled of
+the three.
+
+Three details are load-bearing and easy to get wrong:
+
+* The updated `U` is subtracted in the **MMA accumulator** layout, not the
+  block-2D copy fragment layout. The two have different element orders, so the
+  hand-written SLM write must use this kernel's usual `sn`/`sm` index formula
+  against a `partition_sg_fragment_C` tensor. Indexing the copy fragment by
+  `partition_S` coordinates instead compiles and mostly works, but corrupts
+  ~0.1% of the recurrent state.
+* The tile is staged `(token, channel)`, i.e. `(K, N)` row-major for the `U^T`
+  operand both consumers take. A DPAS A/B sub-group fragment walks the **M/N**
+  axis within a lane, not `K`, so this is the orientation that keeps each lane's
+  slots contiguous. The intuitive `(N, K)` choice measured **~6% slower**
+  (12994.8 us) — larger than the entire optimization.
+* Because of that layout, an A operand's slots are not just close together but
+  *adjacent*: one DPAS atom's M extent of them is a single 16-byte load. Driving
+  the gather from `thr_mma.partition_A/B` of an identity tensor is what makes
+  this safe to assume — the coordinates come from the same partitioner as the
+  fragment, so slot `i` means the same thing in both. Vectorising the A operand
+  is worth -0.40% on its own and is bit-identical to the scalar gather; a B
+  operand is in VNNI order, its slots are 8 elements apart, and it stays scalar.
+
+The publish barrier changes with it. It used to have to be a full
+`sycl::group_barrier`, because what it ordered was a *global* store of `U`;
+staged, it only has to order local memory, and
+`item.barrier(access::fence_space::local_space)` is worth a further -0.15%. The
+non-staged path keeps `sycl::group_barrier`, which still has a global store to
+cover. This also puts SLM back in `fwd_o`, which trial 6 had emptied — for a
+much larger tile, but one that is read by DPAS rather than by scalar indexing.
 
 ## Remaining opportunities
 
@@ -302,14 +417,12 @@ each fusion deletes, as a share of the pipeline's 4900 B per token-head:
 | `prepare` + `compute_A` | `Ka`, `Kb` (write + read) | ~9% |
 | `compute_A` + `inverse` + `compute_wu` | `A` (cold read only) | ~2% |
 
-`U`'s round trip is a further ~7% by the same accounting, but trial 7 measured
-what is actually reachable and it is not worth the code.
-
-That gap is itself a warning about this table: the shares are source-level
-operand bytes, and trial 7 is the one row where the realisable fraction was
-measured end to end. It came out at roughly a third. Treat the remaining shares
-as upper bounds, and price any fusion with an L2-residency probe before
-implementing it.
+Trial 7 already took `U`'s round trip, which this table sized at ~7%; it
+returned 1.6%. That gap is a warning about the remaining rows: the shares are
+source-level operand bytes, and trial 7 is the one case where the realisable
+fraction was measured end to end. It came out at roughly a third, because the
+gather that replaces a block-2D load is not free. Treat the shares above as
+upper bounds, and price any fusion with an L2-residency probe first.
 
 This mirrors FlashKDA's split (see `docs/kda_attention_design.md`): its K1 kernel
 is our `{prepare, compute_A, inverse}` and its K2 is our `fwd_o`. FlashKDA
@@ -359,16 +472,29 @@ Known blockers, so they are not re-derived:
   with the same probe: stage the operand in SLM in *fragment order* so each
   lane's slots are contiguous, read them with one `AlignedArray<bf16, 16>` load,
   and the fragment matches the MMA's own `partition_A` coordinates 2048 of 2048,
-  with a real `cute::gemm` consuming it. So SLM staging is available if a fusion
-  ever needs it — it just has to bypass CuTe's copy layer.
+  with a real `cute::gemm` consuming it.
   cutlass-sycl's own `make_slm_copy` is *not* a working shortcut here: it has
   zero call sites in the vendored tree, and the natural
   `make_A_slm_layout` + `partition_S` spelling fails to compile with
   `Copy_Traits: src failed to vectorize into registers`, because that layout is
   strided rather than contiguous per lane.
-  Trial 7 is what this costs in practice: staging a real operand recovered only
-  about a third of the DRAM traffic it deleted, so budget the gather, not just
-  the bytes saved.
+  Trial 7 shipped this: `gdn::gather_sg_fragment` in `gemm.hpp` is the reusable
+  form, driven by `thr_mma.partition_A/B` of an identity tensor so the slot
+  coordinates come from the same partitioner as the fragment, and
+  `gemm_TSlmS` / `gemm_SlmTS` / `gemm_SlmTS_fused_2B` are the GEMMs built on it.
+  Trial 7 is also what it costs in practice: staging a real operand recovered
+  only about a third of the DRAM traffic it deleted, so budget the gather, not
+  just the bytes saved.
+* **Vectorizing the B-operand gather is the obvious next step for trial 7.**
+  Only the A operand is vector-loaded today; a B operand is in VNNI order, so
+  its slots are 8 elements apart and `gemm_TSlmS` falls back to 64 scalar SLM
+  loads per k-tile. That unprefetched burst is the most likely cause of the
+  low-occupancy penalty the gate now steps around, so removing it could widen
+  the gate or retire it. It needs the operand staged in a second, N-strided
+  orientation (or a transposed tile), which conflicts with the `(token,
+  channel)` layout the A-operand consumer requires — so the two consumers of
+  `U` would need different staged copies, and that has to be priced against the
+  extra SLM and the extra write.
 * **`chunk_size` 64 -> 32 or 16.** `A` traffic is proportional to chunk size, so
   32 saves ~4% and 16 ~6%, and 16 would additionally let the whole `g_floor` /
   saturation-guard / `opt`-fallback subsystem be deleted (this is why FlashKDA

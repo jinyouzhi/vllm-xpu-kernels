@@ -305,10 +305,40 @@ bool chunk_kda_launcher(
         chunk_kda_fwd_o_dv_groups(batch_size, num_heads, head_dim);
     sycl::range<3> local(1, 1, wg_size);
     sycl::range<3> global(batch_size, num_heads * dv_groups, 1);
+
+    // `U` is produced and consumed inside the kernel on the carried-state
+    // path, so it is staged in SLM instead of making a round trip through
+    // global memory. One [chunk_size, chunk_size] tile per value block the
+    // work-group owns; wider heads would push the allocation far enough to
+    // cost occupancy, so they keep the global path.
+    //
+    // Staging trades bandwidth for latency: it deletes DRAM traffic, but the
+    // SLM operand is gathered slot by slot with no prefetch pipeline, unlike
+    // the block-2D load it replaces. That only pays once there are enough
+    // work-groups to hide the gather behind each other. Below the same
+    // saturation point `chunk_kda_fwd_o_dv_groups` uses, it does not: measured
+    // on this sweep the loss grows to +11% at 8 work-groups, while the shapes
+    // that do fill the machine gain 1-4%.
+    const int64_t fwd_o_work_items =
+        static_cast<int64_t>(batch_size) * num_heads * dv_groups * wg_size;
+    const int num_d_tiles = head_dim / chunk_size;
+    const int local_dv = (num_d_tiles + dv_groups - 1) / dv_groups;
+    const bool stage_u_in_slm = local_dv >= 1 && local_dv <= 2 &&
+                                fwd_o_work_items >= fwd_o_target_work_items;
+    // `vec<float, 4>` only to pin the allocation to 16-byte alignment, which
+    // the sub-group fragment loads rely on.
+    using SlmUnit = sycl::vec<float, 4>;
+    static constexpr int kUnitsPerTile =
+        chunk_size * chunk_size * sizeof(T) / sizeof(SlmUnit);
+    const int slm_units = stage_u_in_slm ? local_dv * kUnitsPerTile : 1;
+
     queue.submit([&](sycl::handler& cgh) {
+      sycl::local_accessor<SlmUnit, 1> local_mem(
+          sycl::range<1>(slm_units), cgh);
       cgh.parallel_for<ChunkKdaFwdOKernel<T, StateT>>(
           sycl::nd_range<3>{global * local, local}, kernel_props, [=](auto) {
             chunk_kda_fwd_o_kernel<T, StateT, MMAFwdO>(
+                local_mem,
                 core_attn_out,
                 A,
                 W,
@@ -326,7 +356,8 @@ bool chunk_kda_launcher(
                 total_virtual_seqlen,
                 num_heads,
                 head_dim,
-                dv_groups);
+                dv_groups,
+                stage_u_in_slm);
           });
     });
   }

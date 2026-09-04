@@ -52,7 +52,10 @@ namespace kda_xe2 {
 using namespace cute;
 // The DPAS GEMM helpers (gemm_TTS, gemm_TTS_fused_2A, ...) live in `gdn` and
 // are pure templates, so they are safe to share across translation units.
+using gdn::gemm_SlmTS;
+using gdn::gemm_SlmTS_fused_2B;
 using gdn::gemm_STS;
+using gdn::gemm_TSlmS;
 using gdn::gemm_TTS;
 using gdn::gemm_TTS_fused_2A;
 using gdn::gemm_TTS_fused_2B;
@@ -1331,9 +1334,17 @@ CUTE_DEVICE void chunk_kda_compute_wu_kernel(
 // The only stage that walks a sequence's chunks in order, so it pays one
 // barrier per chunk to order the `S` hand-off. `Tl` is indexed by the lane's
 // own output column, so it is read straight into registers, not staged in SLM.
+//
+// `U` is produced and consumed entirely inside this kernel on the
+// `has_prev_state` path: nothing outside reads the updated value, so instead of
+// storing it and reading it back twice it is staged in SLM, leaving only the
+// `U0` load that `compute_wu` produced. Chunks with no carried state keep the
+// global path, because they do not update `U` at all and staging would make
+// them pay for a round trip they do not need.
 // ---------------------------------------------------------------------------
 template <typename T, typename StateT, class TiledMMA>
 CUTE_DEVICE void chunk_kda_fwd_o_kernel(
+    const sycl::local_accessor<sycl::vec<float, 4>, 1>& slm_mem,
     T* core_attn_out,
     T* A,  // reused as the [chunk, chunk] attention buffer
     T* W,
@@ -1351,7 +1362,8 @@ CUTE_DEVICE void chunk_kda_fwd_o_kernel(
     const int total_virtual_seqlen,
     const int num_heads,
     const int head_dim,
-    const int dv_groups) {
+    const int dv_groups,
+    const bool stage_u_in_slm) {
   auto item = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
   const int local_id = item.get_local_linear_id();
   const int current_batch_id = item.get_group(0);
@@ -1380,6 +1392,22 @@ CUTE_DEVICE void chunk_kda_fwd_o_kernel(
   const auto sg_local_n_coord = cutlass::get_sub_group_id() % ATOM_N;
   const int m_sg_start = sg_local_m_coord * SG_M;
   const int n_sg_start = sg_local_n_coord * SG_N;
+
+  // `U` staging area, one [chunk_size, chunk_size] tile per value block this
+  // work-group owns. It is stored channel-contiguous, so the `U^T` view both
+  // consumers contract over has its M/N axis contiguous and K strided. That is
+  // the orientation the DPAS fragments want: an A/B sub-group fragment walks
+  // M/N within a work-item and K across them, so a lane's slots land next to
+  // each other and can be taken with one vector load instead of a gather.
+  T* const u_slm = reinterpret_cast<T*>(
+      slm_mem.template get_multi_ptr<sycl::access::decorated::no>().get());
+  static constexpr int u_slm_tile_elems = chunk_size * chunk_size;
+  // As the A operand of the state update, `U^T`'s fragment slots walk M, which
+  // is the tile's contiguous axis, so one DPAS atom's M extent of slots is one
+  // vector load. As the B operand of `O2 @ U` they are 8 elements apart, so
+  // that gather stays scalar.
+  static constexpr int u_slm_vec =
+      decltype(size<0>(typename TiledMMA::Shape_MNK{}))::value;
 
   const int num_virtual_chunks = total_virtual_seqlen / chunk_size;
 
@@ -1540,38 +1568,55 @@ CUTE_DEVICE void chunk_kda_fwd_o_kernel(
 
       const int num_d_tiles = head_dim / chunk_size;
 
-      // O += tril(Qt @ Kb^T) @ U for one value block, then write it out. `U`
-      // must already be published to global memory by the caller.
-      auto accumulate_and_store_o = [&](auto& tSrO, auto const& gO_C, int dv) {
-        gemm_TTS(O2_tensor, U_tensor_T, tSrO, 0, dv, mma);
-        if (out_contiguous) {
-          auto tCrO_d = thr_copy_O_d.partition_sg_fragment_S(gO_C);
-          auto tCgO_d = thr_copy_O_d.partition_D(gO_C);
-          reorder(tSrO, tCrO_d);
-          copy(copy_O_d, tCrO_d, tCgO_d);
-          return;
-        }
-        // Permuted destination rows cannot be expressed as a strided tile, so
-        // scatter the accumulator one row at a time. Lanes still cover
-        // consecutive channels, so each row stays coalesced.
-        CUTE_UNROLL
-        for (int sn = 0; sn < SG_N / sub_group_size; ++sn) {
-          const int n_idx =
-              dv * chunk_size + n_sg_start + sn * sub_group_size + sg_local_id;
-          CUTE_UNROLL
-          for (int sm = 0; sm < SG_M; ++sm) {
-            const int m_idx = m_sg_start + sm;
-            if (m_idx >= current_chunk_size) {
-              continue;
-            }
-            const int64_t out_row = token_indx[out_token_start + m_idx];
-            core_attn_out
-                [out_row * num_heads * head_dim +
-                 static_cast<int64_t>(head_id) * head_dim + n_idx] =
-                    static_cast<T>(tSrO(sn * SG_M + sm));
-          }
-        }
+      // A [chunk_size, chunk_size] view of one value block's staged `U`, in the
+      // (channel, token) = (M/N, K) orientation both consumers contract over.
+      auto u_slm_tile = [&](int dv) {
+        return make_tensor(
+            make_smem_ptr(
+                u_slm + ((dv - dv_group) / dv_groups) * u_slm_tile_elems),
+            make_layout(
+                make_shape(Int<chunk_size>{}, Int<chunk_size>{}),
+                make_stride(_1{}, Int<chunk_size>{})));
       };
+
+      // O += tril(Qt @ Kb^T) @ U for one value block, then write it out. `U` is
+      // read from the SLM staging tile when this chunk carries state, and from
+      // global memory otherwise.
+      auto accumulate_and_store_o =
+          [&](auto& tSrO, auto const& gO_C, int dv, bool staged) {
+            if (staged) {
+              gemm_TSlmS(O2_tensor, u_slm_tile(dv), tSrO, 0, mma);
+            } else {
+              gemm_TTS(O2_tensor, U_tensor_T, tSrO, 0, dv, mma);
+            }
+            if (out_contiguous) {
+              auto tCrO_d = thr_copy_O_d.partition_sg_fragment_S(gO_C);
+              auto tCgO_d = thr_copy_O_d.partition_D(gO_C);
+              reorder(tSrO, tCrO_d);
+              copy(copy_O_d, tCrO_d, tCgO_d);
+              return;
+            }
+            // Permuted destination rows cannot be expressed as a strided tile,
+            // so scatter the accumulator one row at a time. Lanes still cover
+            // consecutive channels, so each row stays coalesced.
+            CUTE_UNROLL
+            for (int sn = 0; sn < SG_N / sub_group_size; ++sn) {
+              const int n_idx = dv * chunk_size + n_sg_start +
+                                sn * sub_group_size + sg_local_id;
+              CUTE_UNROLL
+              for (int sm = 0; sm < SG_M; ++sm) {
+                const int m_idx = m_sg_start + sm;
+                if (m_idx >= current_chunk_size) {
+                  continue;
+                }
+                const int64_t out_row = token_indx[out_token_start + m_idx];
+                core_attn_out
+                    [out_row * num_heads * head_dim +
+                     static_cast<int64_t>(head_id) * head_dim + n_idx] =
+                        static_cast<T>(tSrO(sn * SG_M + sm));
+              }
+            }
+          };
 
       if (has_prev_state) {
         for (int dv = dv_group; dv < num_d_tiles; dv += dv_groups) {
@@ -1590,26 +1635,60 @@ CUTE_DEVICE void chunk_kda_fwd_o_kernel(
               W_tensor, Qt_tensor, S_tensor, tSrWS, tSrO, 0, 0, dv, mma);
 
           // U := U0 - W @ S0^T
-          auto tCrWS = thr_copy_U_c.partition_sg_fragment_D(gU_C);
-          reorder(tSrWS, tCrWS);
           auto tCgU_c = thr_copy_U_c.partition_S(gU_C);
           auto tCrU_c = thr_copy_U_c.partition_sg_fragment_D(gU_C);
           copy(copy_U_c, tCgU_c, tCrU_c);
-          CUTE_UNROLL
-          for (int i = 0; i < tCrWS.size(); ++i) {
-            tCrU_c(i) -= tCrWS(i);
+
+          if (stage_u_in_slm) {
+            // `tSrWS` is in the MMA accumulator layout and the loaded `U0` is
+            // in the block-2D copy fragment layout; the two order their
+            // elements differently, so bring `U0` over to the accumulator
+            // before subtracting and index the SLM store with this kernel's
+            // usual sn/sm formula. Indexing the copy fragment by accumulator
+            // coordinates instead compiles and mostly works, but corrupts a
+            // fraction of the recurrent state.
+            auto tSrU = thr_mma.partition_sg_fragment_C(gU_C);
+            reorder(tCrU_c, tSrU);
+            CUTE_UNROLL
+            for (int i = 0; i < tSrWS.size(); ++i) {
+              tSrU(i) -= tSrWS(i);
+            }
+            T* u_tile =
+                u_slm + ((dv - dv_group) / dv_groups) * u_slm_tile_elems;
+            CUTE_UNROLL
+            for (int sn = 0; sn < SG_N / sub_group_size; ++sn) {
+              const int n_idx = n_sg_start + sn * sub_group_size + sg_local_id;
+              CUTE_UNROLL
+              for (int sm = 0; sm < SG_M; ++sm) {
+                u_tile[(m_sg_start + sm) * chunk_size + n_idx] =
+                    static_cast<T>(tSrU(sn * SG_M + sm));
+              }
+            }
+          } else {
+            auto tCrWS = thr_copy_U_c.partition_sg_fragment_D(gU_C);
+            reorder(tSrWS, tCrWS);
+            CUTE_UNROLL
+            for (int i = 0; i < tCrWS.size(); ++i) {
+              tCrU_c(i) -= tCrWS(i);
+            }
+            auto tCrU_d = thr_copy_U_d.partition_sg_fragment_S(gU_C);
+            auto tCgU_d = thr_copy_U_d.partition_D(gU_C);
+            reorder(tCrU_c, tCrU_d);
+            copy(copy_U_d, tCrU_d, tCgU_d);
           }
-          auto tCrU_d = thr_copy_U_d.partition_sg_fragment_S(gU_C);
-          auto tCgU_d = thr_copy_U_d.partition_D(gU_C);
-          reorder(tCrU_c, tCrU_d);
-          copy(copy_U_d, tCrU_d, tCgU_d);
 
-          // U must be visible to every sub-group before O2 @ U reads it back.
-          // It lives in global memory, so the fence has to cover it - a
-          // local-space fence would leave the store unordered.
-          sycl::group_barrier(item.get_group());
+          // U must be visible to every sub-group before O2 @ U reads it back:
+          // each sub-group produces only its own block but consumes the whole
+          // tile. The split barriers inside the GEMMs only pace their k-loops.
+          // Staged, the data is in SLM and a local fence is enough; on the
+          // global path the fence has to cover global memory too.
+          if (stage_u_in_slm) {
+            item.barrier(sycl::access::fence_space::local_space);
+          } else {
+            sycl::group_barrier(item.get_group());
+          }
 
-          accumulate_and_store_o(tSrO, gO_C, dv);
+          accumulate_and_store_o(tSrO, gO_C, dv, stage_u_in_slm);
         }
       } else {
         for (int dv = dv_group; dv < num_d_tiles; dv += dv_groups) {
@@ -1617,15 +1696,19 @@ CUTE_DEVICE void chunk_kda_fwd_o_kernel(
               local_tile(cO, wg_tile, make_coord(0, dv, 0), Step<_1, _1, X>{});
           auto tSrO = thr_mma.partition_sg_fragment_C(gO_C);
           clear(tSrO);
-          accumulate_and_store_o(tSrO, gO_C, dv);
+          accumulate_and_store_o(tSrO, gO_C, dv, false);
         }
       }
 
       // --- S := (S0 + U^T @ Kb) * diag(Tl) -------------------------------
       // Separates the reads of the carried `S` above from the stores below,
       // and publishes the final `U` to the sub-groups that read other blocks
-      // of it. Both operands are in global memory.
+      // of it.
       sycl::group_barrier(item.get_group());
+      // Chunks that carry state contract against the staged `U`; the first
+      // chunk of a sequence never updated `U`, so it reads what `compute_wu`
+      // left in global memory.
+      const bool u_staged = has_prev_state && stage_u_in_slm;
       // Load the carried state into the accumulator (or start from zero on the
       // first chunk of a fresh sequence).
       auto init_state = [&](auto& tSrS, auto const& gS_C) {
@@ -1670,16 +1753,28 @@ CUTE_DEVICE void chunk_kda_fwd_o_kernel(
           init_state(tSrS0, gS_C0);
           init_state(tSrS1, gS_C1);
 
-          gemm_TTS_fused_2B(
-              U_tensor_T,
-              Kb_tensor_T,
-              Kb_tensor_T,
-              tSrS0,
-              tSrS1,
-              dv,
-              dk,
-              dk + 1,
-              mma);
+          if (u_staged) {
+            gemm_SlmTS_fused_2B<u_slm_vec>(
+                u_slm_tile(dv),
+                Kb_tensor_T,
+                Kb_tensor_T,
+                tSrS0,
+                tSrS1,
+                dk,
+                dk + 1,
+                mma);
+          } else {
+            gemm_TTS_fused_2B(
+                U_tensor_T,
+                Kb_tensor_T,
+                Kb_tensor_T,
+                tSrS0,
+                tSrS1,
+                dv,
+                dk,
+                dk + 1,
+                mma);
+          }
 
           scale_and_store(tSrS0, gS_C0, dk);
           scale_and_store(tSrS1, gS_C1, dk + 1);
@@ -1689,7 +1784,11 @@ CUTE_DEVICE void chunk_kda_fwd_o_kernel(
               local_tile(cS, wg_tile, make_coord(dv, dk, 0), Step<_1, _1, X>{});
           auto tSrS = thr_mma.partition_sg_fragment_C(gS_C);
           init_state(tSrS, gS_C);
-          gemm_TTS(U_tensor_T, Kb_tensor_T, tSrS, dv, dk, mma);
+          if (u_staged) {
+            gemm_SlmTS<u_slm_vec>(u_slm_tile(dv), Kb_tensor_T, tSrS, dk, mma);
+          } else {
+            gemm_TTS(U_tensor_T, Kb_tensor_T, tSrS, dv, dk, mma);
+          }
           scale_and_store(tSrS, gS_C, dk);
         }
       }

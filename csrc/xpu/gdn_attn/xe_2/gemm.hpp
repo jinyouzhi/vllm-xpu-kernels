@@ -52,6 +52,58 @@ namespace gdn {
 
 using namespace cute;
 
+// Gather one DPAS operand fragment out of shared local memory.
+//
+// The block-2D copy atoms are global-memory-only. `get_block_2d_copy_A` accepts
+// a tensor built on `make_smem_ptr` and compiles cleanly - nothing on that path
+// asserts on the address space - but at run time the block payload's
+// width/height bounds check clips every access and the fragment comes back all
+// zeros. So an SLM-resident operand has to be read explicitly instead.
+//
+// `coords` is the MMA's own partitioning of an identity tensor, i.e. exactly
+// the (M,K) or (N,K) coordinate each of this work-item's fragment slots stands
+// for. Deriving the mapping from the MMA rather than by hand is what keeps the
+// gather in DPAS order; the fragment and the coordinate tensor come from the
+// same `partition_*` call, so slot `i` corresponds in both.
+//
+// `VecLen` is how many consecutive slots are known to be consecutive elements
+// of `src`, and so can be taken with one vector load. It is 1 for an arbitrary
+// operand. It is the DPAS atom's M extent for an A operand read out of a tile
+// staged M-contiguous: an A fragment's work-item slots walk M at a fixed K
+// (the *lane* index is what walks K), so those slots are adjacent in such a
+// tile. A B operand is in VNNI order - work-item `2t+a` holds N in `{t, t+8}`
+// at K `a + 2j` - so its slots are 8 elements apart and it stays scalar.
+template <int VecLen = 1, class SGFragment, class CoordTensor, class SrcTensor>
+CUTE_DEVICE void gather_sg_fragment(
+    SGFragment& frag,           // destination A/B sub-group fragment
+    CoordTensor const& coords,  // slot -> (M,K) / (N,K)
+    SrcTensor const& src) {     // SLM tensor, same coordinate space
+  using Element = typename SGFragment::value_type;
+  constexpr int slots = decltype(cute::size(frag.layout()))::value;
+  static_assert(
+      slots % VecLen == 0, "fragment is not a whole number of vectors");
+
+  if constexpr (VecLen == 1) {
+    CUTE_UNROLL
+    for (int i = 0; i < slots; ++i) {
+      auto coord = coords(i);
+      frag(i) = static_cast<Element>(src(get<0>(coord), get<1>(coord)));
+    }
+  } else {
+    using Vec = cutlass::AlignedArray<Element, VecLen>;
+    CUTE_UNROLL
+    for (int v = 0; v < slots / VecLen; ++v) {
+      auto coord = coords(v * VecLen);
+      Vec const& src_vec =
+          *reinterpret_cast<Vec const*>(&src(get<0>(coord), get<1>(coord)));
+      CUTE_UNROLL
+      for (int i = 0; i < VecLen; ++i) {
+        frag(v * VecLen + i) = src_vec[i];
+      }
+    }
+  }
+}
+
 template <
     class ATensor,
     class BTensor,
@@ -587,6 +639,256 @@ CUTE_DEVICE void gemm_TTS_fused_2B(
     }
 
     reorder(tArA, tCrA);
+    reorder(tBrB1, tCrB);
+    cute::gemm(mma, tCrA, tCrB, tCrC1);
+
+    reorder(tBrB2, tCrB);
+    cute::gemm(mma, tCrA, tCrB, tCrC2);
+
+    barrier_wait(barrier_scope);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// SLM-operand variants.
+//
+// These mirror `gemm_TTS` and `gemm_TTS_fused_2B`, except that one operand
+// lives in shared local memory and is gathered with `gather_sg_fragment`
+// instead of loaded by a block-2D copy atom. The SLM operand is always exactly
+// one work-group tile wide, so it takes no tile index; the global operand keeps
+// its own prefetch pipeline.
+//
+// The SLM tile must be staged so that the operand's M/N axis is the contiguous
+// one - a DPAS A/B fragment walks M/N within a work-item and K across them, so
+// that is the orientation that keeps each lane's slots close together, and for
+// an A operand makes them a single vector load.
+// ---------------------------------------------------------------------------
+
+// C += A @ B^T with A in global memory and B in SLM.
+template <
+    class ATensor,
+    class SBTensor,
+    class SGCTensor,
+    class TiledMMA>
+CUTE_DEVICE void gemm_TSlmS(
+    ATensor const& A,    // (M,K) global
+    SBTensor const& sB,  // (N,K) SLM, one work-group tile
+    SGCTensor& tCrC,     // (M,N)
+    int wg_m,            // m tile start id
+    TiledMMA const& mma) {
+  auto item = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+  int local_id = item.get_local_linear_id();
+
+  Tensor cA = make_identity_tensor(A.shape());
+  Tensor cB = make_identity_tensor(sB.shape());
+
+  auto wg_tile = mma.tile_mnk();
+
+  Tensor gA = local_tile(cA, select<0, 2>(wg_tile), make_coord(wg_m, _));
+  Tensor gB = local_tile(cB, select<1, 2>(wg_tile), make_coord(0, _));
+
+  auto copy_a = get_block_2d_copy_A<void>(mma, A);
+
+  auto thr_mma = mma.get_slice(local_id);
+  auto thr_copy_a = copy_a.get_slice(local_id);
+
+  auto tCrA = thr_mma.partition_sg_fragment_A(gA(_, _, 0));
+  auto tCrB = thr_mma.partition_sg_fragment_B(gB(_, _, 0));
+
+  auto tArA = thr_copy_a.partition_sg_fragment_D(gA(_, _, 0));
+
+  Tensor tAgA = thr_copy_a.partition_S(gA);
+
+  auto prefetch_a = make_block_2d_prefetch(copy_a);
+  auto thr_prefetch_A = prefetch_a.get_slice(local_id);
+  auto pAgA = thr_prefetch_A.partition_S(gA);
+
+  const int prefetch_dist = 3;
+
+  constexpr SPIRVScope barrier_scope = ScopeWorkgroup;
+
+  int k_tile_count = ceil_div(shape<1>(A), get<2>(wg_tile));
+  int k_tile_prefetch = 0;
+
+  CUTE_UNROLL
+  for (; k_tile_prefetch < prefetch_dist; k_tile_prefetch++) {
+    prefetch(prefetch_a, pAgA(_, _, _, k_tile_prefetch));
+  }
+
+  for (int k_tile = 0; k_tile < k_tile_count; k_tile++, k_tile_prefetch++) {
+    barrier_arrive(barrier_scope);
+
+    copy(copy_a, tAgA(_, _, _, k_tile), tArA);
+
+    if (k_tile_prefetch < k_tile_count) {
+      prefetch(prefetch_a, pAgA(_, _, _, k_tile_prefetch));
+    }
+
+    reorder(tArA, tCrA);
+    gather_sg_fragment(tCrB, thr_mma.partition_B(gB(_, _, k_tile)), sB);
+
+    cute::gemm(mma, tCrA, tCrB, tCrC);
+
+    barrier_wait(barrier_scope);
+  }
+}
+
+// C += A @ B^T with A in SLM and B in global memory.
+template <
+    int AVecLen = 1,
+    class SATensor,
+    class BTensor,
+    class SGCTensor,
+    class TiledMMA>
+CUTE_DEVICE void gemm_SlmTS(
+    SATensor const& sA,  // (M,K) SLM, one work-group tile
+    BTensor const& B,    // (N,K) global
+    SGCTensor& tCrC,     // (M,N)
+    int wg_n,            // n tile start id
+    TiledMMA const& mma) {
+  auto item = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+  int local_id = item.get_local_linear_id();
+
+  Tensor cA = make_identity_tensor(sA.shape());
+  Tensor cB = make_identity_tensor(B.shape());
+
+  auto wg_tile = mma.tile_mnk();
+
+  Tensor gA = local_tile(cA, select<0, 2>(wg_tile), make_coord(0, _));
+  Tensor gB = local_tile(cB, select<1, 2>(wg_tile), make_coord(wg_n, _));
+
+  auto copy_b = get_block_2d_copy_B<void>(mma, B);
+
+  auto thr_mma = mma.get_slice(local_id);
+  auto thr_copy_b = copy_b.get_slice(local_id);
+
+  auto tCrA = thr_mma.partition_sg_fragment_A(gA(_, _, 0));
+  auto tCrB = thr_mma.partition_sg_fragment_B(gB(_, _, 0));
+
+  auto tBrB = thr_copy_b.partition_sg_fragment_D(gB(_, _, 0));
+
+  Tensor tBgB = thr_copy_b.partition_S(gB);
+
+  auto prefetch_b = make_block_2d_prefetch(copy_b);
+  auto thr_prefetch_B = prefetch_b.get_slice(local_id);
+  auto pBgB = thr_prefetch_B.partition_S(gB);
+
+  const int prefetch_dist = 3;
+
+  constexpr SPIRVScope barrier_scope = ScopeWorkgroup;
+
+  int k_tile_count = ceil_div(shape<1>(sA), get<2>(wg_tile));
+  int k_tile_prefetch = 0;
+
+  CUTE_UNROLL
+  for (; k_tile_prefetch < prefetch_dist; k_tile_prefetch++) {
+    prefetch(prefetch_b, pBgB(_, _, _, k_tile_prefetch));
+  }
+
+  for (int k_tile = 0; k_tile < k_tile_count; k_tile++, k_tile_prefetch++) {
+    barrier_arrive(barrier_scope);
+
+    copy(copy_b, tBgB(_, _, _, k_tile), tBrB);
+
+    if (k_tile_prefetch < k_tile_count) {
+      prefetch(prefetch_b, pBgB(_, _, _, k_tile_prefetch));
+    }
+
+    gather_sg_fragment<AVecLen>(
+        tCrA, thr_mma.partition_A(gA(_, _, k_tile)), sA);
+    reorder(tBrB, tCrB);
+
+    cute::gemm(mma, tCrA, tCrB, tCrC);
+
+    barrier_wait(barrier_scope);
+  }
+}
+
+// `gemm_TTS_fused_2B` with the shared A operand in SLM: two n-tiles of the same
+// global B contract against one SLM-resident A, so the gather runs once per
+// k-tile instead of twice.
+template <
+    int AVecLen = 1,
+    class SATensor,
+    class B1Tensor,
+    class B2Tensor,
+    class SGCTensor1,
+    class SGCTensor2,
+    class TiledMMA>
+CUTE_DEVICE void gemm_SlmTS_fused_2B(
+    SATensor const& sA,  // (M,K) SLM shared A operand, one work-group tile
+    B1Tensor const& B1,  // (N,K) first B operand
+    B2Tensor const& B2,  // (N,K) second B operand
+    SGCTensor1& tCrC1,   // accumulator for A * B1^T
+    SGCTensor2& tCrC2,   // accumulator for A * B2^T
+    int wg_n1,           // n tile index for B1
+    int wg_n2,           // n tile index for B2
+    TiledMMA const& mma) {
+  auto item = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+  int local_id = item.get_local_linear_id();
+
+  Tensor cA = make_identity_tensor(sA.shape());
+  Tensor cB1 = make_identity_tensor(B1.shape());
+  Tensor cB2 = make_identity_tensor(B2.shape());
+
+  auto wg_tile = mma.tile_mnk();
+
+  Tensor gA = local_tile(cA, select<0, 2>(wg_tile), make_coord(0, _));
+  Tensor gB1 = local_tile(cB1, select<1, 2>(wg_tile), make_coord(wg_n1, _));
+  Tensor gB2 = local_tile(cB2, select<1, 2>(wg_tile), make_coord(wg_n2, _));
+
+  auto copy_b1 = get_block_2d_copy_B<void>(mma, B1);
+  auto copy_b2 = get_block_2d_copy_B<void>(mma, B2);
+
+  auto thr_mma = mma.get_slice(local_id);
+  auto thr_copy_b1 = copy_b1.get_slice(local_id);
+  auto thr_copy_b2 = copy_b2.get_slice(local_id);
+
+  auto tCrA = thr_mma.partition_sg_fragment_A(gA(_, _, 0));
+  auto tCrB = thr_mma.partition_sg_fragment_B(gB1(_, _, 0));
+
+  auto tBrB1 = thr_copy_b1.partition_sg_fragment_D(gB1(_, _, 0));
+  auto tBrB2 = thr_copy_b2.partition_sg_fragment_D(gB2(_, _, 0));
+
+  Tensor tBgB1 = thr_copy_b1.partition_S(gB1);
+  Tensor tBgB2 = thr_copy_b2.partition_S(gB2);
+
+  auto prefetch_b1 = make_block_2d_prefetch(copy_b1);
+  auto prefetch_b2 = make_block_2d_prefetch(copy_b2);
+
+  auto thr_prefetch_B1 = prefetch_b1.get_slice(local_id);
+  auto thr_prefetch_B2 = prefetch_b2.get_slice(local_id);
+
+  auto pBgB1 = thr_prefetch_B1.partition_S(gB1);
+  auto pBgB2 = thr_prefetch_B2.partition_S(gB2);
+
+  const int prefetch_dist = 3;
+
+  constexpr SPIRVScope barrier_scope = ScopeWorkgroup;
+
+  int k_tile_count = ceil_div(shape<1>(sA), get<2>(wg_tile));
+  int k_tile_prefetch = 0;
+
+  CUTE_UNROLL
+  for (; k_tile_prefetch < prefetch_dist; k_tile_prefetch++) {
+    prefetch(prefetch_b1, pBgB1(_, _, _, k_tile_prefetch));
+    prefetch(prefetch_b2, pBgB2(_, _, _, k_tile_prefetch));
+  }
+
+  for (int k_tile = 0; k_tile < k_tile_count; k_tile++, k_tile_prefetch++) {
+    barrier_arrive(barrier_scope);
+
+    copy(copy_b1, tBgB1(_, _, _, k_tile), tBrB1);
+    copy(copy_b2, tBgB2(_, _, _, k_tile), tBrB2);
+
+    if (k_tile_prefetch < k_tile_count) {
+      prefetch(prefetch_b1, pBgB1(_, _, _, k_tile_prefetch));
+      prefetch(prefetch_b2, pBgB2(_, _, _, k_tile_prefetch));
+    }
+
+    gather_sg_fragment<AVecLen>(
+        tCrA, thr_mma.partition_A(gA(_, _, k_tile)), sA);
+
     reorder(tBrB1, tCrB);
     cute::gemm(mma, tCrA, tCrB, tCrC1);
 
