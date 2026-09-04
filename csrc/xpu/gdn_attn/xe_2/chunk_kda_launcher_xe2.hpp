@@ -92,7 +92,7 @@ bool chunk_kda_launcher(
   const bool prepare_vectorizable =
       head_dim == prepare_vec_width * prepare_sub_group_size &&
       (prepare_vec_width == 2 || prepare_vec_width == 4 ||
-       prepare_vec_width == 8);
+       prepare_vec_width == 8 || prepare_vec_width == 16);
 
   if (prepare_vectorizable) {
     // One sub-group owns a whole (chunk, head), so the launch is sized in
@@ -136,8 +136,10 @@ bool chunk_kda_launcher(
       submit(std::integral_constant<int, 2>{});
     } else if (prepare_vec_width == 4) {
       submit(std::integral_constant<int, 4>{});
-    } else {
+    } else if (prepare_vec_width == 8) {
       submit(std::integral_constant<int, 8>{});
+    } else {
+      submit(std::integral_constant<int, 16>{});
     }
   } else {
     // Phase B of `prepare` assigns one thread per key channel, so sizing the

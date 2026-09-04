@@ -92,7 +92,11 @@ CUTE_DEVICE void report_decay_saturation(int* saturated) {
   flag.store(1);
 }
 
-static constexpr int prepare_sub_group_size = 32;
+// Each lane owns a contiguous slice of `head_dim` and keeps its decay cumsum to
+// itself, so the width only decides how the row is cut - the one cross-lane
+// step, the L2-norm reduction, just needs the sub-group to span the row. 16 is
+// the native Xe2 width, so it avoids emulating a 32-wide sub-group in halves.
+static constexpr int prepare_sub_group_size = 16;
 static constexpr int prepare_work_group_size = 256;
 
 // `Vp` is a pure gather of `v` into the chunk-aligned workspace: no scaling, no
