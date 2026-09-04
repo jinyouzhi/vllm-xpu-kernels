@@ -15,7 +15,7 @@ Xe2 (Battlemage) chunked-prefill path of Kimi Delta Attention.
 | **Final (trial 7)** | **19426 us (-14.2%)** |
 | End-to-end prefill, trials 1-6 (49 configs) | **-4.04% geomean**, best config -10.19% |
 | End-to-end, trial 7 (133 configs) | -0.50% geomean; **-1.10%** over the 27 configs it applies to |
-| Trials | 7 (5 accepted — one only for simplicity — and 2 rejected) |
+| Trials | 10 (5 accepted — one only for simplicity — and 5 rejected) |
 
 Measured with `benchmark/benchmark_kda_chunk_stages.py` (chunk backend only,
 per-stage attribution under `unitrace`) and `benchmark/benchmark_kda.py` (133
@@ -155,6 +155,9 @@ Result: **25171 us, +24.8%.** The zero-spill reading was taken *at 256 GRF*; the
 CuTe DPAS fragments plus the `gemm_TTS` staging registers do not fit in 128, and
 the resulting spill traffic costs far more than the extra occupancy buys. The
 large register file is load-bearing, not leftover.
+
+Trial 10 later re-ran this with the spilling kernels excluded and still lost
+4.75%, so spill is only part of the story — see that section for the rest.
 
 ## Trial 3 (accepted): alternate the traversal direction between stages
 
@@ -483,6 +486,105 @@ non-staged path keeps `sycl::group_barrier`, which still has a global store to
 cover. This also puts SLM back in `fwd_o`, which trial 6 had emptied — for a
 much larger tile, but one that is read by DPAS rather than by scalar indexing.
 
+## Trial 8 (rejected): pad the SLM tile pitch from 64 to 72
+
+The staged `U` tile is 64x64 bf16 with a pitch of exactly `chunk_size` = 64
+elements = 128 bytes. A power-of-two pitch is the classic SLM bank-aliasing
+trigger, and a bank model of the two DPAS operand gathers agreed: at pitch 64
+the A operand touches only 4 of 16 banks (16-way conflict) and B is 2-way; at
+pitch 72 — still 16-byte aligned, so the vectorised A load survives — A drops
+to 4-way and B is conflict-free. It held for both 16- and 32-bank models.
+
+Result, bit-identical and **+6.35% overall**, concentrated exactly on the two
+staged workloads: `prefill_b4_2k` +11.99%, `prefill_b8_1k` +11.07%, while the
+three gated-off `b1_*` shapes moved by <=0.03%.
+
+Splitting the change in two is what explains it. Allocating the padded 64x72
+tile but *indexing* it at stride 64 isolates capacity from arithmetic:
+
+| variant | `b4_2k` | `b8_1k` | total |
+| --- | ---: | ---: | ---: |
+| padded allocation only | +0.15% | +0.23% | **+0.15%** |
+| padded allocation + padded indexing | +11.87% | +11.42% | **+6.38%** |
+
+So bank conflicts were never the cost — the pitch arithmetic was. This is worth
+recording twice over, because the standard advice is the opposite: padding SLM
+to break bank aliasing made this kernel 12% slower.
+
+It also leaves a genuinely useful positive: **the marginal SLM kilobyte is
+nearly free here** (8192 -> 9216 bytes per tile cost 0.15%), so these staged
+shapes are not SLM-capacity bound. That does not retroactively invalidate the
+SLM argument in *The gated-off path has to be a separate kernel* above — that
+comparison was 0 -> 8 KB, which can cross an occupancy cliff that 8 -> 9 KB
+does not.
+
+## Trial 9 (rejected): give `U` a single source
+
+`fwd_o` carries `has_prev_state = (local_chunk != 0) || initial_state`, and only
+the true branch reads staged `U`; chunk 0 falls back to global `U`. Since SLM
+turned out to be nearly free, chunk 0 could stage `U0` too, collapsing the
+runtime branch into the compile-time `StageU` and deleting the global-`U` GEMMs
+from the staged instantiation entirely.
+
+It was bit-identical and **+6.32% overall** — `b4_2k` +11.33%, `b8_1k` +11.96%.
+The gated-off `b1_*` shapes actually improved slightly (-0.13% to -0.16%),
+which is consistent: they run the *other* instantiation, which did get smaller.
+
+## The staged `fwd_o` kernel sits on the 256-GRF allocation cliff
+
+Two unrelated changes each costing 11.3-12.0% on exactly the two staged shapes
+is not a coincidence, it is a quantized resource cliff. IGC shader dumps
+(`IGC_ShaderDumpEnable=1 IGC_DumpToCustomDir=<dir>` in front of the build; touch
+a source first to force a rebuild) name it directly. Compare the `//.RA type`
+and `//.spill size` lines in the `.asm` for
+`ChunkKdaFwdOKernelIN7cutlass10bfloat16_tEfLb1EEE`:
+
+| | RA type | spill |
+| --- | --- | ---: |
+| current | `HYBRID_BC_RA` | none |
+| trial 9 | `GRAPH_COLORING_SPILL_FF_BC_RA` | **2816 B** |
+
+and the message mix moves with it — the spilling build gains 72 bare
+`load/store.ugm.d32x{16,64}t.a32` scratch messages (no cache-control suffix,
+unlike real global traffic which is `a64`) and doubles its SLM messages.
+
+Two practical consequences:
+
+* **Screen with the dump before benchmarking.** A build is ~8 minutes and a
+  trustworthy interleaved A/B is far longer; grepping two lines out of the
+  `.asm` rejects a change for free. `//.RA type` containing `SPILL` is
+  disqualifying on its own.
+* Do not trust `.zeinfo` for this. Its `spill_size` field reported `0` for the
+  spilling build, and its `slm_size` reported `0` for a kernel that allocates
+  8 KB. The vISA statistics footer in the `.asm` is the authoritative source.
+
+Anything added to this kernel has to pay for itself *and* stay under the limit.
+That is the standing reason the remaining `fwd_o` ideas below are hard.
+
+## Trial 10 (rejected): 128-GRF only where it provably does not spill
+
+Trial 2 lowered the chunk-parallel stages to `grf_size<128>` and lost 24.8%,
+attributing it to spill. With the dump-based screen that explanation can be
+tested rather than assumed — and it turns out to be incomplete.
+
+Screening every kernel at 128 GRF shows only two that actually spill:
+`compute_wu` (4352 B) and the `V=16` (head_dim 256) `prepare` pack (1344 B).
+Leaving those two at 256 and dropping the rest — `prepare` V=2/4/8, the scalar
+`prepare`, `compute_A`, `inverse` — gives a **provably spill-free** 128-GRF
+build covering ~40% of pipeline time, at twice the resident threads per EU.
+
+It is still slower: bit-identical, **+4.75% total**, and this time uniformly
+across all five workloads (+3.81% to +5.77%), as expected for a change to
+stages every shape runs.
+
+So spill was never the whole story. The pipeline already runs at ~92% of its
+achievable streaming bandwidth, and *at that point extra occupancy has no idle
+bandwidth left to fill*, while halving the per-thread register budget costs
+unrolling and in-flight loads. Total bytes in flight is roughly threads x
+registers, so trading one for the other is neutral at best. `grf_size<256>` is
+the right setting for this pipeline for a reason that has nothing to do with
+spill, and lowering it should not be retried on occupancy grounds.
+
 ## Remaining opportunities
 
 Everything left is cross-kernel fusion: keeping an intermediate in registers
@@ -512,7 +614,18 @@ Known blockers, so they are not re-derived:
   trial 4 fixed. What remains is the grouping: `prepare` covers one (chunk, head)
   as 256 work items partitioned along `head_dim`, while `compute_A` partitions
   the 64x64 `A` tile as a 4x2 sub-group grid. One decomposition serving both
-  costs occupancy on small shapes (`b1_1k` would drop to ~25%).
+  costs occupancy on small shapes (`b1_1k` would drop to ~25%). Trial 7's gate
+  is a working precedent for dispatching by shape, so the small-shape objection
+  is answerable; the decomposition itself is the real work.
+* **Recomputing `Ka` or `Kb` instead of storing both is arithmetically dead**,
+  so it should not be re-attempted. With `Ka = k_hat * exp(G)` and
+  `Kb = k_hat * exp(-G) * beta`, deriving either from the other requires `G`,
+  which is head_dim-sized — exactly the bytes the elimination was supposed to
+  save. Every rearrangement of the same idea (storing `exp(G)` in place of `Qt`,
+  having consumers re-scan the cumulative sum, and so on) nets zero. Separately,
+  `prepare` writes a chunk-aligned, zero-padded workspace precisely so no
+  downstream GEMM needs predication; reading the ragged `q`/`k` directly would
+  reintroduce varlen indexing into every consumer.
 * **`compute_A` + `inverse` + `compute_wu`** is the smallest and hardest of the
   three. `A` is only ~11% of `compute_wu`'s traffic and ~20% of `compute_A`'s,
   and `compute_wu`'s read already hits cache, so the fusion converts cold reads
