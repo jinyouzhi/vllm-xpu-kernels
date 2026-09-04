@@ -1327,10 +1327,13 @@ CUTE_DEVICE void chunk_kda_compute_wu_kernel(
 //   U  = U0 - W @ S0^T
 //   O  = Qt @ S0^T + tril(Qt @ Kb^T) @ U
 //   S  = (S0 + U^T @ Kb) * diag(Tl)
+//
+// The only stage that walks a sequence's chunks in order, so it pays one
+// barrier per chunk to order the `S` hand-off. `Tl` is indexed by the lane's
+// own output column, so it is read straight into registers, not staged in SLM.
 // ---------------------------------------------------------------------------
 template <typename T, typename StateT, class TiledMMA>
 CUTE_DEVICE void chunk_kda_fwd_o_kernel(
-    const sycl::local_accessor<float, 1>& slm_mem_const,
     T* core_attn_out,
     T* A,  // reused as the [chunk, chunk] attention buffer
     T* W,
@@ -1351,7 +1354,6 @@ CUTE_DEVICE void chunk_kda_fwd_o_kernel(
     const int dv_groups) {
   auto item = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
   const int local_id = item.get_local_linear_id();
-  const int local_range = item.get_local_range(2);
   const int current_batch_id = item.get_group(0);
   const int head_id = item.get_group(1) / dv_groups;
   // Value-dimension slice owned by this work-group. `dv_groups == 1` restores
@@ -1360,10 +1362,6 @@ CUTE_DEVICE void chunk_kda_fwd_o_kernel(
 
   auto sg = item.get_sub_group();
   const int sg_local_id = sg.get_local_linear_id();
-
-  float* Tl_slm = static_cast<float*>(
-      slm_mem_const.template get_multi_ptr<sycl::access::decorated::no>()
-          .get());
 
   TiledMMA mma{};
   auto wg_tile = mma.tile_mnk();
@@ -1422,15 +1420,11 @@ CUTE_DEVICE void chunk_kda_fwd_o_kernel(
           static_cast<int64_t>(chunk_id) * chunk_size * head_dim;
 
       // Ends the previous chunk: its `S` stores have to be visible before this
-      // chunk reads `S` back as a GEMM operand, and `Tl_slm` must not be
-      // refilled while a sub-group is still reading it.
+      // chunk reads `S` back as a GEMM operand.
       sycl::group_barrier(item.get_group());
-      for (int j = local_id; j < head_dim; j += local_range) {
-        Tl_slm[j] =
-            Tl[static_cast<int64_t>(head_id) * num_virtual_chunks * head_dim +
-               static_cast<int64_t>(chunk_id) * head_dim + j];
-      }
-      item.barrier(sycl::access::fence_space::local_space);
+      const float* Tl_chunk =
+          Tl + static_cast<int64_t>(head_id) * num_virtual_chunks * head_dim +
+          static_cast<int64_t>(chunk_id) * head_dim;
 
       auto W_tensor = make_tensor(
           make_gmem_ptr(W + operand_offset),
@@ -1650,7 +1644,7 @@ CUTE_DEVICE void chunk_kda_fwd_o_kernel(
         for (int sn = 0; sn < SG_N / sub_group_size; ++sn) {
           const int n_idx =
               dk * chunk_size + n_sg_start + sn * sub_group_size + sg_local_id;
-          const float scale = Tl_slm[n_idx];
+          const float scale = Tl_chunk[n_idx];
           CUTE_UNROLL
           for (int sm = 0; sm < SG_M; ++sm) {
             tSrS(sn * SG_M + sm) *= scale;

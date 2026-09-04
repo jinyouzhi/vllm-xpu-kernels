@@ -306,11 +306,9 @@ bool chunk_kda_launcher(
     sycl::range<3> local(1, 1, wg_size);
     sycl::range<3> global(batch_size, num_heads * dv_groups, 1);
     queue.submit([&](sycl::handler& cgh) {
-      sycl::local_accessor<float, 1> local_mem(sycl::range<1>(head_dim), cgh);
       cgh.parallel_for<ChunkKdaFwdOKernel<T, StateT>>(
           sycl::nd_range<3>{global * local, local}, kernel_props, [=](auto) {
             chunk_kda_fwd_o_kernel<T, StateT, MMAFwdO>(
-                local_mem,
                 core_attn_out,
                 A,
                 W,
