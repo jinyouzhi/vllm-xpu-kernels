@@ -346,18 +346,24 @@ Gated, over the 133-config sweep (`benchmark_kda.py`, same build A/B-swapped):
 
 | | configs | geomean | net |
 | --- | ---: | ---: | ---: |
-| staging enabled | 27 | **-1.10%** | -1307 us |
-| staging gated off | 106 | -0.35% | +99 us |
+| chunk backend, staged | 27 | **-1.10%** | -1307 us |
+| chunk backend, gated off | 43 | +0.12% | +107 us |
+| not the chunk backend | 63 | -0.66% | -8 us |
 | all | 133 | **-0.50%** | -1208 us |
+
+The third row matters for reading the other two. Decode and spec workloads do
+not run this pipeline at all — they take the recurrent kernel — so those 63
+configs are a control group that no change here can move, and they come out at
+-8 us total. Only the first two rows are this trial's doing.
 
 ### The gated-off path has to be a separate kernel
 
 The gated-off group is the useful diagnostic here, because it is supposed to
 be *zero*: the gate sends it down the same global path the trial-6 kernel took.
-It was not. With staging as a runtime `if` inside one kernel it came out at
-**+123 us** over 106 configs, and the sign was suspiciously consistent — four
-interleaved A/B rounds on the tp1 prefill shapes had the gated-off ones slower
-every single round, by 0.1-0.4%.
+It was not. With staging as a runtime `if` inside one kernel the 43 gated-off
+chunk configs came out at **+128 us**, and the sign was suspiciously consistent
+— four interleaved A/B rounds on the tp1 prefill shapes had the gated-off ones
+slower every single round, by 0.1-0.4%.
 
 A branch that is never taken still costs, in two ways. The work-group declares
 the SLM allocation whether or not it stages, and trial 6 had deliberately left
@@ -373,16 +379,17 @@ paying for the global path it no longer uses:
 
 | | shared kernel | split kernels |
 | --- | ---: | ---: |
-| staged (27) | -0.92% / -1060 us | **-1.10% / -1307 us** |
-| gated off (106) | -0.07% / +123 us | -0.35% / +99 us |
+| chunk, staged (27) | -0.92% / -1060 us | **-1.10% / -1307 us** |
+| chunk, gated off (43) | +0.25% / +128 us | **+0.12% / +107 us** |
+| not the chunk backend (63) | -0.29% / -5 us | -0.66% / -8 us |
 | all (133) | -0.24% / -936 us | **-0.50% / -1208 us** |
 
-The gated-off residual shrank but did not reach zero: splitting it by path,
-the 63 decode and spec configs that never enter `fwd_o` net **-8 us**, which is
-the control group behaving correctly, while the 43 gated-off *chunk* configs
-still net +107 us (~+0.25% each). Something small still differs on that path;
-it is worth an extra 1207 us elsewhere, so it ships, but it is not noise and
-should not be written off as such.
+The gated-off residual shrank but did not reach zero: the 63 configs that never
+enter this pipeline net -8 us, which is the control group behaving correctly,
+while the 43 gated-off *chunk* configs still net +107 us (~+0.25% each).
+Something small still differs on that path; it is worth an extra 1207 us
+elsewhere, so it ships, but it is not noise and should not be written off as
+such.
 
 That control group is also what catches bad measurements. A non-interleaved
 run of the split build appeared to show the gated-off group **-2.99%** faster,
@@ -405,16 +412,16 @@ and is not:
 
 | group | configs | geomean | net |
 | --- | ---: | ---: | ---: |
-| chunk path (prefill + mix) | 40 | **-0.49%** | -1062 us |
+| chunk backend (prefill + mix) | 40 | **-0.49%** | -1062 us |
 | — of which staged | 21 | **-1.13%** | -1108 us |
-| decode / spec | 36 | +1.93% | **+25 us** |
+| recurrent backend (decode + spec) | 36 | +1.93% | **+25 us** |
 
-The decode and spec workloads run the recurrent path and never enter `fwd_o`,
-so read them in absolute terms: 36 configs, +25 us total, under a microsecond
-each. Their +1.93% geomean is the same artefact the control group exists to
-expose — most of them are ~26 us measurements where a fraction of a microsecond
-of launch jitter is a percent, so the geomean of that group carries no
-information and only the net does.
+The decode and spec workloads never enter this pipeline, so read them in
+absolute terms: 36 configs, +25 us total, under a microsecond each. Their
++1.93% geomean is the same artefact the control group exists to expose — most
+of them are ~26 us measurements where a fraction of a microsecond of launch
+jitter is a percent, so the geomean of that group carries no information and
+only the net does.
 
 The gate also interacts with tensor parallelism, which is worth knowing before
 reading much into any single TP configuration. `dv_groups` is bounded by
