@@ -110,6 +110,22 @@ CUTE_DEVICE inline bool chunk_kda_needs_vp(const int* token_indx, int valid) {
   return token_indx != nullptr || valid < chunk_size;
 }
 
+// The chunk-parallel stages share one flattened (chunk, head) grid and each
+// reads back what the previous stage wrote. Work-groups retire roughly in index
+// order, so a consumer that walks the grid backwards starts on the tiles still
+// resident in the 24 MB last-level cache rather than the coldest ones. This
+// only permutes which work-group handles which tile, so results are unchanged.
+CUTE_DEVICE inline int
+chunk_kda_group_id(int group, int group_range, bool reverse) {
+  return reverse ? group_range - 1 - group : group;
+}
+
+// `prepare` is token-parallel and always runs forwards, so the rest of the
+// chain alternates from there to keep every hand-off warm.
+static constexpr bool chunk_kda_reverse_compute_A = true;
+static constexpr bool chunk_kda_reverse_inverse = false;
+static constexpr bool chunk_kda_reverse_compute_wu = true;
+
 // DPAS tiling policies. These mirror the GDN chunk pipeline's proven shapes but
 // are declared locally so this file does not have to include
 // `chunk_gated_delta_rule_kernels_xe2.hpp` (which defines non-inline symbols
@@ -676,9 +692,12 @@ CUTE_DEVICE void chunk_kda_compute_A_kernel(
   const int local_id = item.get_local_linear_id();
   // One work-group per (chunk, head): looping every head inside a
   // chunk-indexed work-group would cap parallelism at the chunk count.
-  const int head_id = item.get_group(1) % num_heads;
-  int chunk_id = item.get_group(1) / num_heads;
-  const int global_chunk_range = item.get_group_range(1) / num_heads;
+  const int group_range = item.get_group_range(1);
+  const int group_id = chunk_kda_group_id(
+      item.get_group(1), group_range, chunk_kda_reverse_compute_A);
+  const int head_id = group_id % num_heads;
+  int chunk_id = group_id / num_heads;
+  const int global_chunk_range = group_range / num_heads;
 
   auto sg = item.get_sub_group();
   const int sg_local_id = sg.get_local_linear_id();
@@ -879,13 +898,13 @@ CUTE_DEVICE void chunk_kda_inverse_opt_kernel(
   auto item = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
   int local_id = item.get_local_linear_id();
   int local_range = item.get_local_range(2);
-  int head_id = item.get_group(1) % num_heads;
-  int chunk_id = item.get_group(1) / num_heads;
-  const int global_chunk_range = item.get_group_range(1) / num_heads;
+  const int group_range = item.get_group_range(1);
+  const int group_id = chunk_kda_group_id(
+      item.get_group(1), group_range, chunk_kda_reverse_inverse);
+  const int head_id = group_id % num_heads;
+  int chunk_id = group_id / num_heads;
+  const int global_chunk_range = group_range / num_heads;
 
-  // l2norm for q, k
-  int group_id = item.get_group(1);
-  int group_range = item.get_group_range(1);
   auto sg = item.get_sub_group();
   int sg_id = sg.get_group_linear_id();
   int sg_range = sg.get_group_linear_range();
@@ -1183,10 +1202,12 @@ CUTE_DEVICE void chunk_kda_compute_wu_kernel(
     const int head_dim) {
   auto item = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
   const int local_id = item.get_local_linear_id();
-  const int head_id = item.get_group(1) % num_heads;
-  int chunk_id = item.get_group(1) / num_heads;
-  const int global_chunk_range = item.get_group_range(1) / num_heads;
-
+  const int group_range = item.get_group_range(1);
+  const int group_id = chunk_kda_group_id(
+      item.get_group(1), group_range, chunk_kda_reverse_compute_wu);
+  const int head_id = group_id % num_heads;
+  int chunk_id = group_id / num_heads;
+  const int global_chunk_range = group_range / num_heads;
   TiledMMA mma{};
   auto wg_tile = mma.tile_mnk();
   auto thr_mma = mma.get_slice(local_id);
