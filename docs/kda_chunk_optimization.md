@@ -562,6 +562,17 @@ Known blockers, so they are not re-derived:
   Trial 7 is also what it costs in practice: staging a real operand recovered
   only about a third of the DRAM traffic it deleted, so budget the gather, not
   just the bytes saved.
+* **Peel the first chunk out of the sequential loop.** `has_prev_state` is
+  `(local_chunk != 0) || initial_state`, so within a launch it can only be false
+  on the very first iteration and is true for every one after. It is
+  nonetheless a runtime branch, which means the `StageU == true` kernel carries
+  *both* `gemm_SlmTS_fused_2B` and `gemm_TTS_fused_2B` and its register
+  allocation has to cover both. That is the same defect the split kernels just
+  fixed between launches, still present inside one. Peeling iteration zero out
+  of the loop would leave a branch-free body. The cost is a duplicated loop
+  body, and unlike the gated-off case the second path is not dead code — every
+  sequence really does execute it once — so this is worth measuring rather than
+  assuming.
 * **Vectorizing the B-operand gather is the obvious next step for trial 7.**
   Only the A operand is vector-loaded today; a B operand is in VNNI order, so
   its slots are 8 elements apart and `gemm_TSlmS` falls back to 64 scalar SLM
