@@ -356,6 +356,29 @@ about +-1% on the ~26 us decode shapes, and confirms the +0.97% worst case
 among the staged configs is not distinguishable from noise either. The worst
 real regression is gone: +11.6% before the gate, +0.97% after.
 
+Restricting the same sweep to the four Kimi-Linear shapes, dropping the
+synthetic ones, does not change the picture (-0.27% over 76 configs against
+-0.24% over 133), but it does show where the gain is and is not:
+
+| group | configs | geomean | net |
+| --- | ---: | ---: | ---: |
+| chunk path (prefill + mix) | 40 | -0.36% | -866 us |
+| — of which staged | 21 | **-0.96%** | -913 us |
+| decode / spec | 36 | -0.18% | **-2 us** |
+
+The decode and spec workloads run the recurrent path and never enter `fwd_o`,
+so their 36 configs net 2 us — they are a control group, and their per-config
+swings of up to 5% on ~26 us measurements are the same noise floor again.
+
+The gate also interacts with tensor parallelism, which is worth knowing before
+reading much into any single TP configuration. `dv_groups` is bounded by
+`head_dim / chunk_size`, so the grid scales with the head count, and sharding
+heads across ranks shrinks it: at tp1 seven of ten chunk configs stage, at tp8
+only three do, and those three are within noise. A tp8 rank needs batch >= 64
+before staging engages at all. The optimization is therefore worth most at low
+TP and long sequences, and the gate is what keeps it from being actively
+harmful at high TP.
+
 The gate costs some of the headline. The seven-shape chunk sweep gives back
 0.34pp (19782 -> 19426 us, **-1.80%** instead of -2.14%) and the five tp1
 prefill workloads give back 0.6pp, because `b1_1k`, `b1_4k` and `b1_8k` are
