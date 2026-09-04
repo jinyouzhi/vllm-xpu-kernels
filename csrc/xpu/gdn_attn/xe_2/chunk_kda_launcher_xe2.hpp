@@ -23,7 +23,7 @@ template <typename T, typename StateT>
 class ChunkKdaInverseOptKernel;
 template <typename T, typename StateT>
 class ChunkKdaComputeWUKernel;
-template <typename T, typename StateT>
+template <typename T, typename StateT, bool StageU>
 class ChunkKdaFwdOKernel;
 
 // Returns false when `abort_after_prepare` reports that stage 1 produced a
@@ -330,36 +330,51 @@ bool chunk_kda_launcher(
     using SlmUnit = sycl::vec<float, 4>;
     static constexpr int kUnitsPerTile =
         chunk_size * chunk_size * sizeof(T) / sizeof(SlmUnit);
-    const int slm_units = stage_u_in_slm ? local_dv * kUnitsPerTile : 1;
 
-    queue.submit([&](sycl::handler& cgh) {
-      sycl::local_accessor<SlmUnit, 1> local_mem(
-          sycl::range<1>(slm_units), cgh);
-      cgh.parallel_for<ChunkKdaFwdOKernel<T, StateT>>(
-          sycl::nd_range<3>{global * local, local}, kernel_props, [=](auto) {
-            chunk_kda_fwd_o_kernel<T, StateT, MMAFwdO>(
-                local_mem,
-                core_attn_out,
-                A,
-                W,
-                U,
-                Qt,
-                Kb,
-                Tl,
-                recurrent_state,
-                recurrent_state_stride_0,
-                query_start_loc,
-                state_indices,
-                has_initial_state,
-                token_indx,
-                batch_size,
-                total_virtual_seqlen,
-                num_heads,
-                head_dim,
-                dv_groups,
-                stage_u_in_slm);
-          });
-    });
+    // The two paths are separate kernels rather than a runtime branch. Sharing
+    // one kernel makes the gated-off shapes pay for staging they never do: the
+    // work-group still declares the SLM allocation, and register allocation
+    // covers both paths, so the untaken branch costs occupancy. Trial 6 had
+    // left `fwd_o` using no SLM at all, and a shared kernel silently gave that
+    // up everywhere. Measured over four interleaved A/B rounds the shared form
+    // was consistently 0.1-0.4% slower on gated-off shapes, in the same
+    // direction every round; split, they are back to the trial-6 kernel.
+    auto submit_fwd_o = [&](auto stage_tag) {
+      constexpr bool StageU = decltype(stage_tag)::value;
+      queue.submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<SlmUnit, 1> local_mem(
+            sycl::range<1>(StageU ? local_dv * kUnitsPerTile : 0), cgh);
+        cgh.parallel_for<ChunkKdaFwdOKernel<T, StateT, StageU>>(
+            sycl::nd_range<3>{global * local, local}, kernel_props, [=](auto) {
+              chunk_kda_fwd_o_kernel<StageU, T, StateT, MMAFwdO>(
+                  local_mem,
+                  core_attn_out,
+                  A,
+                  W,
+                  U,
+                  Qt,
+                  Kb,
+                  Tl,
+                  recurrent_state,
+                  recurrent_state_stride_0,
+                  query_start_loc,
+                  state_indices,
+                  has_initial_state,
+                  token_indx,
+                  batch_size,
+                  total_virtual_seqlen,
+                  num_heads,
+                  head_dim,
+                  dv_groups);
+            });
+      });
+    };
+
+    if (stage_u_in_slm) {
+      submit_fwd_o(std::true_type{});
+    } else {
+      submit_fwd_o(std::false_type{});
+    }
   }
 
   return true;

@@ -1342,7 +1342,7 @@ CUTE_DEVICE void chunk_kda_compute_wu_kernel(
 // global path, because they do not update `U` at all and staging would make
 // them pay for a round trip they do not need.
 // ---------------------------------------------------------------------------
-template <typename T, typename StateT, class TiledMMA>
+template <bool StageU, typename T, typename StateT, class TiledMMA>
 CUTE_DEVICE void chunk_kda_fwd_o_kernel(
     const sycl::local_accessor<sycl::vec<float, 4>, 1>& slm_mem,
     T* core_attn_out,
@@ -1362,8 +1362,7 @@ CUTE_DEVICE void chunk_kda_fwd_o_kernel(
     const int total_virtual_seqlen,
     const int num_heads,
     const int head_dim,
-    const int dv_groups,
-    const bool stage_u_in_slm) {
+    const int dv_groups) {
   auto item = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
   const int local_id = item.get_local_linear_id();
   const int current_batch_id = item.get_group(0);
@@ -1639,7 +1638,7 @@ CUTE_DEVICE void chunk_kda_fwd_o_kernel(
           auto tCrU_c = thr_copy_U_c.partition_sg_fragment_D(gU_C);
           copy(copy_U_c, tCgU_c, tCrU_c);
 
-          if (stage_u_in_slm) {
+          if constexpr (StageU) {
             // `tSrWS` is in the MMA accumulator layout and the loaded `U0` is
             // in the block-2D copy fragment layout; the two order their
             // elements differently, so bring `U0` over to the accumulator
@@ -1682,13 +1681,13 @@ CUTE_DEVICE void chunk_kda_fwd_o_kernel(
           // tile. The split barriers inside the GEMMs only pace their k-loops.
           // Staged, the data is in SLM and a local fence is enough; on the
           // global path the fence has to cover global memory too.
-          if (stage_u_in_slm) {
+          if constexpr (StageU) {
             item.barrier(sycl::access::fence_space::local_space);
           } else {
             sycl::group_barrier(item.get_group());
           }
 
-          accumulate_and_store_o(tSrO, gO_C, dv, stage_u_in_slm);
+          accumulate_and_store_o(tSrO, gO_C, dv, StageU);
         }
       } else {
         for (int dv = dv_group; dv < num_d_tiles; dv += dv_groups) {
@@ -1708,7 +1707,7 @@ CUTE_DEVICE void chunk_kda_fwd_o_kernel(
       // Chunks that carry state contract against the staged `U`; the first
       // chunk of a sequence never updated `U`, so it reads what `compute_wu`
       // left in global memory.
-      const bool u_staged = has_prev_state && stage_u_in_slm;
+      const bool u_staged = has_prev_state && StageU;
       // Load the carried state into the accumulator (or start from zero on the
       // first chunk of a fresh sequence).
       auto init_state = [&](auto& tSrS, auto const& gS_C) {

@@ -14,7 +14,7 @@ Xe2 (Battlemage) chunked-prefill path of Kimi Delta Attention.
 | After trials 1-6 | 19782 us (-12.6%) |
 | **Final (trial 7)** | **19426 us (-14.2%)** |
 | End-to-end prefill, trials 1-6 (49 configs) | **-4.04% geomean**, best config -10.19% |
-| End-to-end, trial 7 (133 configs) | -0.24% geomean; **-0.92%** over the 27 configs it applies to |
+| End-to-end, trial 7 (133 configs) | -0.50% geomean; **-1.10%** over the 27 configs it applies to |
 | Trials | 7 (5 accepted — one only for simplicity — and 2 rejected) |
 
 Measured with `benchmark/benchmark_kda_chunk_stages.py` (chunk backend only,
@@ -346,29 +346,75 @@ Gated, over the 133-config sweep (`benchmark_kda.py`, same build A/B-swapped):
 
 | | configs | geomean | net |
 | --- | ---: | ---: | ---: |
-| staging enabled | 27 | **-0.92%** | -1060 us |
-| staging gated off | 106 | -0.07% | +123 us |
-| all | 133 | **-0.24%** | -936 us |
+| staging enabled | 27 | **-1.10%** | -1307 us |
+| staging gated off | 106 | -0.35% | +99 us |
+| all | 133 | **-0.50%** | -1208 us |
 
-The 106 gated-off configs run bit-identical code to the baseline, so their
-spread is pure run-to-run noise — which usefully calibrates the noise floor at
-about +-1% on the ~26 us decode shapes, and confirms the +0.97% worst case
-among the staged configs is not distinguishable from noise either. The worst
-real regression is gone: +11.6% before the gate, +0.97% after.
+### The gated-off path has to be a separate kernel
+
+The gated-off group is the useful diagnostic here, because it is supposed to
+be *zero*: the gate sends it down the same global path the trial-6 kernel took.
+It was not. With staging as a runtime `if` inside one kernel it came out at
+**+123 us** over 106 configs, and the sign was suspiciously consistent — four
+interleaved A/B rounds on the tp1 prefill shapes had the gated-off ones slower
+every single round, by 0.1-0.4%.
+
+A branch that is never taken still costs, in two ways. The work-group declares
+the SLM allocation whether or not it stages, and trial 6 had deliberately left
+`fwd_o` using **no** SLM at all, so a shared kernel silently gave that up on
+every shape. Register allocation likewise covers both paths, so the staged
+path's live values depress occupancy even where it is switched off.
+
+So `stage_u_in_slm` is a template parameter, not a runtime flag, and the
+launcher dispatches to one of two kernels with `std::true_type` /
+`std::false_type`; the non-staged instantiation allocates a zero-length
+`local_accessor`. That helped **both** sides — the staged path also stops
+paying for the global path it no longer uses:
+
+| | shared kernel | split kernels |
+| --- | ---: | ---: |
+| staged (27) | -0.92% / -1060 us | **-1.10% / -1307 us** |
+| gated off (106) | -0.07% / +123 us | -0.35% / +99 us |
+| all (133) | -0.24% / -936 us | **-0.50% / -1208 us** |
+
+The gated-off residual shrank but did not reach zero: splitting it by path,
+the 63 decode and spec configs that never enter `fwd_o` net **-8 us**, which is
+the control group behaving correctly, while the 43 gated-off *chunk* configs
+still net +107 us (~+0.25% each). Something small still differs on that path;
+it is worth an extra 1207 us elsewhere, so it ships, but it is not noise and
+should not be written off as such.
+
+That control group is also what catches bad measurements. A non-interleaved
+run of the split build appeared to show the gated-off group **-2.99%** faster,
+which would have been nonsense — the recurrent-path configs moved -13% in it,
+and no `fwd_o` change can touch those. Every config under 40 us had simply
+dropped ~3 us of launch overhead for that run. All the numbers above are
+therefore min-of-two with the builds alternated between runs.
+
+The gated-off configs take the same *branch* as the baseline but no longer the
+same *binary*, which is the whole point of the previous section; their residual
+is small but not zero. Where the noise floor really can be read off is the
+recurrent-path control group, at about +-1% on the ~26 us decode shapes — which
+also says the worst staged case, +0.94%, is not distinguishable from noise. The
+worst real regression is gone either way: +11.6% before the gate, +0.94% after,
+and only three staged configs regress at all.
 
 Restricting the same sweep to the four Kimi-Linear shapes, dropping the
-synthetic ones, does not change the picture (-0.27% over 76 configs against
--0.24% over 133), but it does show where the gain is and is not:
+synthetic ones, does not change the picture, but it does show where the gain is
+and is not:
 
 | group | configs | geomean | net |
 | --- | ---: | ---: | ---: |
-| chunk path (prefill + mix) | 40 | -0.36% | -866 us |
-| — of which staged | 21 | **-0.96%** | -913 us |
-| decode / spec | 36 | -0.18% | **-2 us** |
+| chunk path (prefill + mix) | 40 | **-0.49%** | -1062 us |
+| — of which staged | 21 | **-1.13%** | -1108 us |
+| decode / spec | 36 | +1.93% | **+25 us** |
 
 The decode and spec workloads run the recurrent path and never enter `fwd_o`,
-so their 36 configs net 2 us — they are a control group, and their per-config
-swings of up to 5% on ~26 us measurements are the same noise floor again.
+so read them in absolute terms: 36 configs, +25 us total, under a microsecond
+each. Their +1.93% geomean is the same artefact the control group exists to
+expose — most of them are ~26 us measurements where a fraction of a microsecond
+of launch jitter is a percent, so the geomean of that group carries no
+information and only the net does.
 
 The gate also interacts with tensor parallelism, which is worth knowing before
 reading much into any single TP configuration. `dv_groups` is bounded by
@@ -380,21 +426,22 @@ TP and long sequences, and the gate is what keeps it from being actively
 harmful at high TP.
 
 The gate costs some of the headline. The seven-shape chunk sweep gives back
-0.34pp (19782 -> 19426 us, **-1.80%** instead of -2.14%) and the five tp1
-prefill workloads give back 0.6pp, because `b1_1k`, `b1_4k` and `b1_8k` are
-64-work-group shapes and now take the global path:
+0.33pp (19906 -> 19546 us, **-1.81%** instead of -2.14%) and the five tp1
+prefill workloads give back 0.4pp, because `b1_1k`, `b1_4k` and `b1_8k` are
+64-work-group shapes and now take the global path (min of four interleaved
+rounds):
 
 | workload | `fwd_o` WGs | staged | before | after |
 | --- | ---: | --- | ---: | ---: |
-| `prefill_b1_1k` | 64 | no | 395.0 | 396.6 (+0.41%) |
-| `prefill_b1_4k` | 64 | no | 1707.5 | 1710.3 (+0.16%) |
-| `prefill_b1_8k` | 64 | no | 3467.3 | 3469.7 (+0.07%) |
-| `prefill_b4_2k` | 256 | yes | 3478.3 | 3425.9 (**-1.51%**) |
-| `prefill_b8_1k` | 256 | yes | 3408.7 | 3326.6 (**-2.41%**) |
-| total | | | 12456.7 | 12329.1 (**-1.02%**) |
+| `prefill_b1_1k` | 64 | no | 394.4 | 395.6 (+0.31%) |
+| `prefill_b1_4k` | 64 | no | 1707.6 | 1707.6 (-0.00%) |
+| `prefill_b1_8k` | 64 | no | 3464.8 | 3467.8 (+0.09%) |
+| `prefill_b4_2k` | 256 | yes | 3481.5 | 3416.5 (**-1.87%**) |
+| `prefill_b8_1k` | 256 | yes | 3409.8 | 3319.6 (**-2.65%**) |
+| total | | | 12458.2 | 12307.2 (**-1.21%**) |
 
 That is the right trade: -1.61% on five hand-picked shapes is worth less than
--0.24% across everything, and the three shapes it gives up were within noise of
+-0.50% across everything, and the three shapes it gives up were within noise of
 break-even anyway. Thresholds of 64 and 128 work-groups were also measured and
 are indistinguishable overall (-0.19% both), but leave 3-4x more regression on
 the table, so the saturation point is both the best and the most principled of
