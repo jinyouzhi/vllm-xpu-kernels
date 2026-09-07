@@ -3,6 +3,11 @@
 Target: `csrc/xpu/gdn_attn/xe_2/chunk_kda_kernels_xe2.hpp` and its launcher, the
 Xe2 (Battlemage) chunked-prefill path of Kimi Delta Attention.
 
+Every number here was measured on Battlemage. For a port to Crescent Island,
+`kda_chunk_optimization_cri.md` restates these trials as a re-evaluation
+checklist, separating the conclusions that are about the algorithm from the ones
+that are about this machine.
+
 ## Summary
 
 | | |
