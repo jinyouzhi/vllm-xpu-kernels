@@ -105,6 +105,7 @@ CUTE_DEVICE void gather_sg_fragment(
 }
 
 template <
+    SPIRVScope barrier_scope = ScopeWorkgroup,
     class ATensor,
     class BTensor,
     class SGCTensor,
@@ -117,7 +118,7 @@ CUTE_DEVICE void gemm_TTS(
     int wg_n,          // n tile start id
     TiledMMA const& mma) {
   auto item = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
-  int local_id = item.get_local_linear_id();
+  int local_id = item.get_local_linear_id() % cute::size(mma);
 
   Tensor cA = make_identity_tensor(A.shape());
   Tensor cB = make_identity_tensor(B.shape());
@@ -157,8 +158,6 @@ CUTE_DEVICE void gemm_TTS(
 
   const int prefetch_dist = 3;
 
-  constexpr SPIRVScope barrier_scope = ScopeWorkgroup;
-
   int k_tile_count = ceil_div(shape<1>(A), get<2>(wg_tile));
   int k_tile_prefetch = 0;
 
@@ -189,6 +188,7 @@ CUTE_DEVICE void gemm_TTS(
 }
 
 template <
+    SPIRVScope barrier_scope = ScopeWorkgroup,
     class ASGCTensor,
     class BTensor,
     class CSGCTensor,
@@ -201,7 +201,7 @@ CUTE_DEVICE void gemm_STS(
     int wg_n,                // n tile start id
     TiledMMA const& mma) {
   auto item = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
-  int local_id = item.get_local_linear_id();
+  int local_id = item.get_local_linear_id() % cute::size(mma);
 
   Tensor cB = make_identity_tensor(B.shape());
 
@@ -229,8 +229,6 @@ CUTE_DEVICE void gemm_STS(
   auto pBgB = thr_prefetch_B.partition_S(gB);
 
   const int prefetch_dist = 3;
-
-  constexpr SPIRVScope barrier_scope = ScopeWorkgroup;
 
   int k_tile_count = ceil_div(shape<1>(B), get<2>(wg_tile));
   int k_tile_prefetch = 0;

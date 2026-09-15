@@ -15,6 +15,8 @@ template <typename T, typename StateT>
 class ChunkKdaPrepareKernel;
 template <typename T, typename StateT, int V>
 class ChunkKdaPrepareVecKernel;
+template <typename T, typename StateT, int V>
+class ChunkKdaFusedPrepareAInvKernel;
 template <typename T, typename StateT>
 class ChunkKdaComputeAKernel;
 template <typename T, typename StateT>
@@ -84,30 +86,46 @@ bool chunk_kda_launcher(
   syclex::properties prepare_props{
       syclex::sub_group_size<prepare_sub_group_size>};
 
-  // --- stage 1: prepare -----------------------------------------------------
-  // The vectorized variant needs `head_dim == prepare_sub_group_size * V` with
-  // a power-of-two V so the per-lane pack is naturally aligned. Everything else
-  // falls back to the scalar one-thread-per-channel kernel.
-  const int prepare_vec_width = head_dim / prepare_sub_group_size;
-  const bool prepare_vectorizable =
-      head_dim == prepare_vec_width * prepare_sub_group_size &&
-      (prepare_vec_width == 2 || prepare_vec_width == 4 ||
-       prepare_vec_width == 8 || prepare_vec_width == 16);
+  // --- fused stage 1 + 2 + 3 (preparevec + compute_A + inverse_opt) --------
+  using WGTileA = chunk_gemm_policy_compute_A::WGTile;
+  using SGLayoutA = chunk_gemm_policy_compute_A::SGLayout;
+  using MMAComputeA = typename cute::TiledMMAHelper<
+      cute::MMA_Atom<decltype(op)>,
+      cute::Layout<WGTileA>,
+      SGLayoutA>::TiledMMA;
 
-  if (prepare_vectorizable) {
-    // One sub-group owns a whole (chunk, head), so the launch is sized in
-    // sub-groups; the kernel drops any tail sub-group that maps past num_heads.
-    const int sgs_per_wg = prepare_work_group_size / prepare_sub_group_size;
-    const int wg_count = (chunk_head_wgs + sgs_per_wg - 1) / sgs_per_wg;
-    sycl::range<3> local(1, 1, prepare_work_group_size);
-    sycl::range<3> global(1, wg_count, 1);
+  using WGTileInv = chunk_gemm_policy_inverse::WGTile;
+  using SGLayoutInv = chunk_gemm_policy_inverse::SGLayout;
+  using MMAInverse = typename cute::TiledMMAHelper<
+      cute::MMA_Atom<decltype(op)>,
+      cute::Layout<WGTileInv>,
+      SGLayoutInv>::TiledMMA;
 
-    auto submit = [&](auto width) {
+  const int fused_vec_width = head_dim / cute::detail::subgroup_size;
+  const bool can_run_fused =
+      !vllm::xpu::is_pvc() &&
+      (fused_vec_width == 4 || fused_vec_width == 8 || fused_vec_width == 16);
+
+  if (can_run_fused) {
+    auto mma = MMAComputeA{};
+    const int wg_size = cute::size(mma);
+    sycl::range<3> local(1, 1, wg_size);
+    sycl::range<3> global(1, chunk_head_wgs, 1);
+
+    const int slm_size = 8 * head_dim + 2 * chunk_size;
+    auto submit_fused = [&](auto width) {
       constexpr int V = decltype(width)::value;
       queue.submit([&](sycl::handler& cgh) {
-        cgh.parallel_for<ChunkKdaPrepareVecKernel<T, StateT, V>>(
-            sycl::nd_range<3>{global * local, local}, prepare_props, [=](auto) {
-              chunk_kda_prepare_vec_kernel<T, V>(
+        sycl::local_accessor<float, 1> local_mem(sycl::range<1>(slm_size), cgh);
+        cgh.parallel_for<ChunkKdaFusedPrepareAInvKernel<T, StateT, V>>(
+            sycl::nd_range<3>{global * local, local}, kernel_props, [=](auto) {
+              chunk_kda_fused_prepare_a_inv_kernel<
+                  T,
+                  V,
+                  MMAComputeA,
+                  MMAInverse>(
+                  local_mem,
+                  A,
                   Ka,
                   Kb,
                   Qt,
@@ -132,131 +150,184 @@ bool chunk_kda_launcher(
       });
     };
 
-    if (prepare_vec_width == 2) {
-      submit(std::integral_constant<int, 2>{});
-    } else if (prepare_vec_width == 4) {
-      submit(std::integral_constant<int, 4>{});
-    } else if (prepare_vec_width == 8) {
-      submit(std::integral_constant<int, 8>{});
+    if (fused_vec_width == 4) {
+      submit_fused(std::integral_constant<int, 4>{});
+    } else if (fused_vec_width == 8) {
+      submit_fused(std::integral_constant<int, 8>{});
     } else {
-      submit(std::integral_constant<int, 16>{});
+      submit_fused(std::integral_constant<int, 16>{});
+    }
+
+    if (abort_after_prepare != nullptr && (*abort_after_prepare)()) {
+      return false;
     }
   } else {
-    // Phase B of `prepare` assigns one thread per key channel, so sizing the
-    // work-group to head_dim keeps every lane busy through the serial cumsum
-    // instead of idling half of a fixed 256-wide group at head_dim == 128.
-    const int prepare_wg =
-        std::max(prepare_sub_group_size * 2, std::min(512, (int)head_dim));
-    sycl::range<3> local(1, 1, prepare_wg);
-    sycl::range<3> global(1, chunk_head_wgs, 1);
-    const int slm_size = chunk_size * 4;
-    queue.submit([&](sycl::handler& cgh) {
-      sycl::local_accessor<float, 1> local_mem(sycl::range<1>(slm_size), cgh);
-      cgh.parallel_for<ChunkKdaPrepareKernel<T, StateT>>(
-          sycl::nd_range<3>{global * local, local}, prepare_props, [=](auto) {
-            chunk_kda_prepare_kernel<T>(
-                local_mem,
-                Ka,
-                Kb,
-                Qt,
-                Vp,
-                Tl,
-                q,
-                k,
-                v,
-                raw_gate,
-                raw_beta,
-                a_log,
-                dt_bias,
-                lower_bound,
-                saturated,
-                query_start_loc,
-                token_indx,
-                total_virtual_seqlen,
-                batch_size,
-                num_heads,
-                head_dim);
-          });
-    });
-  }
+    // --- stage 1: prepare
+    // ----------------------------------------------------- The vectorized
+    // variant needs `head_dim == prepare_sub_group_size * V` with a
+    // power-of-two V so the per-lane pack is naturally aligned. Everything else
+    // falls back to the scalar one-thread-per-channel kernel.
+    const int prepare_vec_width = head_dim / prepare_sub_group_size;
+    const bool prepare_vectorizable =
+        head_dim == prepare_vec_width * prepare_sub_group_size &&
+        (prepare_vec_width == 2 || prepare_vec_width == 4 ||
+         prepare_vec_width == 8);
 
-  if (abort_after_prepare != nullptr && (*abort_after_prepare)()) {
-    return false;
-  }
+    if (prepare_vectorizable) {
+      // One sub-group owns a whole (chunk, head), so the launch is sized in
+      // sub-groups; the kernel drops any tail sub-group that maps past
+      // num_heads.
+      const int sgs_per_wg = prepare_work_group_size / prepare_sub_group_size;
+      const int wg_count = (chunk_head_wgs + sgs_per_wg - 1) / sgs_per_wg;
+      sycl::range<3> local(1, 1, prepare_work_group_size);
+      sycl::range<3> global(1, wg_count, 1);
 
-  // --- stage 2: A = I + tril_strict(Ka @ Kb^T) ------------------------------
-  using WGTileA = chunk_gemm_policy_compute_A::WGTile;
-  using SGLayoutA = chunk_gemm_policy_compute_A::SGLayout;
-  using MMAComputeA = typename cute::TiledMMAHelper<
-      cute::MMA_Atom<decltype(op)>,
-      cute::Layout<WGTileA>,
-      SGLayoutA>::TiledMMA;
-  {
-    auto mma = MMAComputeA{};
-    const int wg_size = cute::size(mma);
-    sycl::range<3> local(1, 1, wg_size);
-    sycl::range<3> global(1, chunk_head_wgs, 1);
-    queue.submit([&](sycl::handler& cgh) {
-      cgh.parallel_for<ChunkKdaComputeAKernel<T, StateT>>(
-          sycl::nd_range<3>{global * local, local}, kernel_props, [=](auto) {
-            chunk_kda_compute_A_kernel<T, MMAComputeA>(
-                A,
-                Ka,
-                Kb,
-                query_start_loc,
-                total_virtual_seqlen,
-                batch_size,
-                num_heads,
-                head_dim);
-          });
-    });
-  }
+      auto submit = [&](auto width) {
+        constexpr int V = decltype(width)::value;
+        queue.submit([&](sycl::handler& cgh) {
+          cgh.parallel_for<ChunkKdaPrepareVecKernel<T, StateT, V>>(
+              sycl::nd_range<3>{global * local, local},
+              prepare_props,
+              [=](auto) {
+                chunk_kda_prepare_vec_kernel<T, V>(
+                    Ka,
+                    Kb,
+                    Qt,
+                    Vp,
+                    Tl,
+                    q,
+                    k,
+                    v,
+                    raw_gate,
+                    raw_beta,
+                    a_log,
+                    dt_bias,
+                    lower_bound,
+                    saturated,
+                    query_start_loc,
+                    token_indx,
+                    total_virtual_seqlen,
+                    batch_size,
+                    num_heads,
+                    head_dim);
+              });
+        });
+      };
 
-  // --- stage 3: A := (I + A)^-1 ---------------------------------------------
-  using WGTileInv = chunk_gemm_policy_inverse::WGTile;
-  using SGLayoutInv = chunk_gemm_policy_inverse::SGLayout;
-  using MMAInverse = typename cute::TiledMMAHelper<
-      cute::MMA_Atom<decltype(op)>,
-      cute::Layout<WGTileInv>,
-      SGLayoutInv>::TiledMMA;
-  if (vllm::xpu::is_bmg()) {
-    auto mma = MMAInverse{};
-    const int wg_size = cute::size(mma);
-    sycl::range<3> local(1, 1, wg_size);
-    // The kernel derives (chunk, head) from the group index, so the group
-    // count has to stay a whole multiple of num_heads.
-    sycl::range<3> global(1, chunk_head_wgs, 1);
-    queue.submit([&](sycl::handler& cgh) {
-      cgh.parallel_for<ChunkKdaInverseOptKernel<T, StateT>>(
-          sycl::nd_range<3>{global * local, local}, kernel_props, [=](auto) {
-            chunk_kda_inverse_opt_kernel<T, MMAInverse>(
-                A,
-                query_start_loc,
-                total_virtual_seqlen,
-                batch_size,
-                num_heads);
-          });
-    });
-  } else {
-    // PVC hits an accumulator issue with the blocked DPAS inverse, so keep the
-    // scalar forward substitution available there.
-    const int wg_size = 64;
-    sycl::range<3> local(1, 1, wg_size);
-    sycl::range<3> global(1, sm_count * MaxThreadsPerSM / wg_size, 1);
-    const int slm_size = chunk_size * chunk_size * 2;
-    queue.submit([&](sycl::handler& cgh) {
-      sycl::local_accessor<float, 1> local_mem(sycl::range<1>(slm_size), cgh);
-      cgh.parallel_for<ChunkKdaInverseKernel<T, StateT>>(
-          sycl::nd_range<3>{global * local, local}, [=](auto) {
-            chunk_kda_inverse_kernel<T>(
-                local_mem,
-                A,
-                query_start_loc,
-                total_virtual_seqlen,
-                batch_size,
-                num_heads);
-          });
-    });
+      if (prepare_vec_width == 2) {
+        submit(std::integral_constant<int, 2>{});
+      } else if (prepare_vec_width == 4) {
+        submit(std::integral_constant<int, 4>{});
+      } else {
+        submit(std::integral_constant<int, 8>{});
+      }
+    } else {
+      // Phase B of `prepare` assigns one thread per key channel, so sizing the
+      // work-group to head_dim keeps every lane busy through the serial cumsum
+      // instead of idling half of a fixed 256-wide group at head_dim == 128.
+      const int prepare_wg =
+          std::max(prepare_sub_group_size * 2, std::min(512, (int)head_dim));
+      sycl::range<3> local(1, 1, prepare_wg);
+      sycl::range<3> global(1, chunk_head_wgs, 1);
+      const int slm_size = chunk_size * 4;
+      queue.submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<float, 1> local_mem(sycl::range<1>(slm_size), cgh);
+        cgh.parallel_for<ChunkKdaPrepareKernel<T, StateT>>(
+            sycl::nd_range<3>{global * local, local}, prepare_props, [=](auto) {
+              chunk_kda_prepare_kernel<T>(
+                  local_mem,
+                  Ka,
+                  Kb,
+                  Qt,
+                  Vp,
+                  Tl,
+                  q,
+                  k,
+                  v,
+                  raw_gate,
+                  raw_beta,
+                  a_log,
+                  dt_bias,
+                  lower_bound,
+                  saturated,
+                  query_start_loc,
+                  token_indx,
+                  total_virtual_seqlen,
+                  batch_size,
+                  num_heads,
+                  head_dim);
+            });
+      });
+    }
+
+    if (abort_after_prepare != nullptr && (*abort_after_prepare)()) {
+      return false;
+    }
+
+    // --- stage 2: A = I + tril_strict(Ka @ Kb^T)
+    // ------------------------------
+    {
+      auto mma = MMAComputeA{};
+      const int wg_size = cute::size(mma);
+      sycl::range<3> local(1, 1, wg_size);
+      sycl::range<3> global(1, chunk_head_wgs, 1);
+      queue.submit([&](sycl::handler& cgh) {
+        cgh.parallel_for<ChunkKdaComputeAKernel<T, StateT>>(
+            sycl::nd_range<3>{global * local, local}, kernel_props, [=](auto) {
+              chunk_kda_compute_A_kernel<T, MMAComputeA>(
+                  A,
+                  Ka,
+                  Kb,
+                  query_start_loc,
+                  total_virtual_seqlen,
+                  batch_size,
+                  num_heads,
+                  head_dim);
+            });
+      });
+    }
+
+    // --- stage 3: A := (I + A)^-1
+    // ---------------------------------------------
+    if (!vllm::xpu::is_pvc()) {
+      auto mma = MMAInverse{};
+      const int wg_size = cute::size(mma);
+      sycl::range<3> local(1, 1, wg_size);
+      // The kernel derives (chunk, head) from the group index, so the group
+      // count has to stay a whole multiple of num_heads.
+      sycl::range<3> global(1, chunk_head_wgs, 1);
+      queue.submit([&](sycl::handler& cgh) {
+        cgh.parallel_for<ChunkKdaInverseOptKernel<T, StateT>>(
+            sycl::nd_range<3>{global * local, local}, kernel_props, [=](auto) {
+              chunk_kda_inverse_opt_kernel<T, MMAInverse>(
+                  A,
+                  query_start_loc,
+                  total_virtual_seqlen,
+                  batch_size,
+                  num_heads);
+            });
+      });
+    } else {
+      // PVC hits an accumulator issue with the blocked DPAS inverse, so keep
+      // the scalar forward substitution available there.
+      const int wg_size = 64;
+      sycl::range<3> local(1, 1, wg_size);
+      sycl::range<3> global(1, sm_count * MaxThreadsPerSM / wg_size, 1);
+      const int slm_size = chunk_size * chunk_size * 2;
+      queue.submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<float, 1> local_mem(sycl::range<1>(slm_size), cgh);
+        cgh.parallel_for<ChunkKdaInverseKernel<T, StateT>>(
+            sycl::nd_range<3>{global * local, local}, [=](auto) {
+              chunk_kda_inverse_kernel<T>(
+                  local_mem,
+                  A,
+                  query_start_loc,
+                  total_virtual_seqlen,
+                  batch_size,
+                  num_heads);
+            });
+      });
+    }
   }
 
   // --- stage 4: W = A^-1 @ Ka, U = A^-1 @ Vp --------------------------------
